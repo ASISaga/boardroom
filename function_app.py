@@ -1,6 +1,7 @@
 import azure.functions as func
 
 from business_infinity.blueprints import (
+    auth_blueprint,
     boardroom_blueprint,
     health_blueprint,
     seo_blueprint,
@@ -13,7 +14,7 @@ app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 # bp = aos_app.get_blueprint()
 # app.register_blueprint(bp)
 
+app.register_blueprint(auth_blueprint)
 app.register_blueprint(boardroom_blueprint)
 app.register_blueprint(seo_blueprint)
 app.register_blueprint(health_blueprint)
-
