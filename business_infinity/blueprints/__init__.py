@@ -1,4 +1,4 @@
-"""Azure Function blueprints for BusinessInfinity.
+"""Azure Function blueprints for BusinessInfinity. 
 
 Each domain exposes its own ``func.Blueprint`` instance:
 
