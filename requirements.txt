@@ -1,3 +1,6 @@
 azure-functions
-aos-client-sdk @ git+https://github.com/ASISaga/aos-client-sdk.git
+aos-client-sdk[azure] @ git+https://github.com/ASISaga/aos-client-sdk.git
 pyyaml
+pyjwt
+requests
+azure-identity
