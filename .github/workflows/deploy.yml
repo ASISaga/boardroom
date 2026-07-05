@@ -145,7 +145,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Log deployment context
         shell: bash
@@ -166,7 +166,7 @@ jobs:
           echo "::endgroup::"
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: pip
@@ -209,7 +209,7 @@ jobs:
       # ID without a pre-existing GitHub environment secret.
       - name: Azure Login (OIDC — bootstrap for Key Vault)
         if: needs.resolve-env.outputs.key_vault_url != ''
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -241,7 +241,7 @@ jobs:
           echo "::endgroup::"
 
       - name: Azure Login (OIDC)
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           # Use the client ID retrieved from Key Vault when available; otherwise
           # fall back to the GitHub environment secret.  The kv_client_id step
@@ -303,7 +303,7 @@ jobs:
           echo "::endgroup::"
 
       - name: Deploy to Azure Function App
-        uses: azure/functions-action@v1
+        uses: azure/functions-action@v1.5.4
         with:
           app-name: ${{ steps.resolve.outputs.function_app }}
           package: .
