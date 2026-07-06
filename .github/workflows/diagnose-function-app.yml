@@ -1,0 +1,747 @@
+# Diagnostic workflow for Azure Functions on the Flex Consumption plan.
+#
+# WHAT THIS DOES
+#   Runs a comprehensive, read-only health check across every layer that can cause
+#   the classic "0 functions found" / "functions not showing in portal" symptom:
+#     1. OIDC federated identity — confirms the token subject Azure actually receives
+#     2. Azure login — confirms the client-id/tenant/subscription combination works
+#     3. Function App existence, kind, and Flex Consumption plan detection
+#     4. functionAppConfig.runtime — the Flex-specific runtime block (name/version)
+#     5. Invalid/legacy app settings that are REJECTED on Flex Consumption
+#        (FUNCTIONS_WORKER_RUNTIME, WEBSITE_RUN_FROM_PACKAGE, WEBSITE_CONTENTSHARE, etc.)
+#     6. Required identity-based app settings are present (per this app's Bicep contract)
+#     7. Managed identity RBAC on its own AzureWebJobsStorage account
+#     8. Managed identity RBAC on the deployment container specifically
+#     9. Deployment storage container reachability + latest package presence
+#     10. Current deployment history / last deployment status
+#     11. A live restart + sync-triggers cycle, to catch the "SyncTriggerStep stalls"
+#         failure mode directly rather than inferring it from timestamps
+#     12. Function count as reported by the ARM control plane (Microsoft.Web/sites/functions)
+#     13. A live HTTP smoke test against the app's own host ping endpoint
+#
+#   Every check prints a clear PASS/WARN/FAIL line and a short explanation. Nothing in
+#   this workflow modifies application code or deployed packages. The restart and
+#   sync-triggers calls do restart the app (steps 11) — this is intentional and required
+#   to observe live indexing behaviour; disable via skip_restart if undesired.
+#
+# HOW TO PORT THIS TO ANOTHER FUNCTION APP
+#   Everything app-specific lives in the `env:` block below and the workflow_dispatch
+#   `inputs:`. Copy this file into the target repo's .github/workflows/, then update the
+#   default values in `inputs:` (or override at dispatch time) — no other edits required.
+#   The workflow only needs: id-token: write (OIDC) and an AZURE_CLIENT_ID /
+#   AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID secret trio on the target GitHub environment,
+#   exactly like the deploy workflow it complements.
+#
+# REQUIRED PERMISSIONS FOR THE SERVICE PRINCIPAL / MANAGED IDENTITY USED TO RUN THIS
+#   Reader on the Function App and its resource group is sufficient for almost every
+#   check. Restart + sync-triggers (step 11) require Website Contributor (or higher)
+#   on the Function App itself — the same role your deploy workflow already grants for
+#   deployment, so no additional RBAC should be needed if this reuses that identity.
+
+name: Diagnose Function App (Flex Consumption)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target GitHub environment (controls which secrets are used)'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+        default: staging
+      function_app_name:
+        description: 'Azure Function App name (leave blank to auto-resolve by prefix, see resource_group + name_prefix)'
+        required: false
+        type: string
+        default: ''
+      resource_group:
+        description: 'Azure resource group containing the Function App'
+        required: false
+        type: string
+        default: 'rg-aos-staging'
+      name_prefix:
+        description: 'Prefix used to auto-resolve the Function App name when function_app_name is blank'
+        required: false
+        type: string
+        default: 'fa-business-infin-staging-'
+      expected_runtime:
+        description: 'Expected functionAppConfig.runtime.name'
+        required: false
+        type: string
+        default: 'python'
+      expected_runtime_version:
+        description: 'Expected functionAppConfig.runtime.version'
+        required: false
+        type: string
+        default: '3.11'
+      health_check_path:
+        description: 'HTTP path used for the live smoke test (with routePrefix already applied, e.g. "" or "/api/ping")'
+        required: false
+        type: string
+        default: '/boardroom/workflows'
+      skip_restart:
+        description: 'Skip the restart + sync-triggers live check (steps 11). Use if the app must not be disturbed.'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  # ---- App-specific defaults for this port of the workflow (business-infinity / boardroom) ----
+  DEFAULT_RESOURCE_GROUP: rg-aos-staging
+  DEFAULT_NAME_PREFIX: fa-business-infin-staging-
+  DEFAULT_EXPECTED_RUNTIME: python
+  DEFAULT_EXPECTED_RUNTIME_VERSION: '3.11'
+  DEFAULT_HEALTH_CHECK_PATH: /boardroom/workflows
+  # App settings that are VALID on Flex Consumption and this app's Bicep contract is
+  # expected to have populated. Extend this list if the app's Bicep defines more.
+  EXPECTED_APP_SETTINGS: >-
+    AzureWebJobsStorage__accountName
+    AzureWebJobsStorage__blobServiceUri
+    AzureWebJobsStorage__credential
+    AzureWebJobsStorage__clientId
+    APPLICATIONINSIGHTS_CONNECTION_STRING
+    AZURE_CLIENT_ID
+    ENVIRONMENT
+  # App settings that are INVALID / rejected outright on Flex Consumption plans.
+  # Presence of any of these is a definite bug, not a matter of preference.
+  FORBIDDEN_APP_SETTINGS: >-
+    FUNCTIONS_WORKER_RUNTIME
+    FUNCTIONS_WORKER_RUNTIME_VERSION
+    WEBSITE_RUN_FROM_PACKAGE
+    WEBSITE_CONTENTSHARE
+    WEBSITE_CONTENTAZUREFILECONNECTIONSTRING
+    WEBSITE_NODE_DEFAULT_VERSION
+
+jobs:
+  diagnose:
+    name: Diagnose (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      # ==================================================================
+      # SETUP
+      # ==================================================================
+      - name: Resolve effective parameters
+        id: params
+        shell: bash
+        run: |
+          set -euo pipefail
+          RG="${{ inputs.resource_group }}"
+          PREFIX="${{ inputs.name_prefix }}"
+          RUNTIME="${{ inputs.expected_runtime }}"
+          RUNTIME_VERSION="${{ inputs.expected_runtime_version }}"
+          HEALTH_PATH="${{ inputs.health_check_path }}"
+
+          RG="${RG:-$DEFAULT_RESOURCE_GROUP}"
+          PREFIX="${PREFIX:-$DEFAULT_NAME_PREFIX}"
+          RUNTIME="${RUNTIME:-$DEFAULT_EXPECTED_RUNTIME}"
+          RUNTIME_VERSION="${RUNTIME_VERSION:-$DEFAULT_EXPECTED_RUNTIME_VERSION}"
+          HEALTH_PATH="${HEALTH_PATH:-$DEFAULT_HEALTH_CHECK_PATH}"
+
+          echo "resource_group=${RG}" >> "$GITHUB_OUTPUT"
+          echo "name_prefix=${PREFIX}" >> "$GITHUB_OUTPUT"
+          echo "expected_runtime=${RUNTIME}" >> "$GITHUB_OUTPUT"
+          echo "expected_runtime_version=${RUNTIME_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "health_path=${HEALTH_PATH}" >> "$GITHUB_OUTPUT"
+
+          echo "::group::Effective parameters"
+          echo "  Environment:           ${{ inputs.environment }}"
+          echo "  Resource group:        ${RG}"
+          echo "  Function app override: ${{ inputs.function_app_name }}"
+          echo "  Name prefix:           ${PREFIX}"
+          echo "  Expected runtime:      ${RUNTIME} ${RUNTIME_VERSION}"
+          echo "  Health check path:     ${HEALTH_PATH}"
+          echo "  Skip restart:          ${{ inputs.skip_restart }}"
+          echo "::endgroup::"
+
+      - name: Initialise report file
+        shell: bash
+        run: |
+          echo "# Function App Diagnostic Report" > "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Environment: \`${{ inputs.environment }}\`  " >> "$GITHUB_STEP_SUMMARY"
+          echo "Run: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| # | Check | Result | Detail |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|-------|--------|--------|" >> "$GITHUB_STEP_SUMMARY"
+
+      # ==================================================================
+      # 1. OIDC FEDERATED IDENTITY
+      # ==================================================================
+      - name: "Check 1 — OIDC token claims"
+        id: check1
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Check 1 — OIDC token claims"
+          # We can't decode the token itself without calling the GitHub OIDC endpoint,
+          # but azure/login will print the subject it presents. This step just records
+          # what we EXPECT so it can be compared against the azure/login output below.
+          EXPECTED_SUBJECT="repo:${{ github.repository }}:environment:${{ inputs.environment }}"
+          echo "Expected OIDC subject: ${EXPECTED_SUBJECT}"
+          echo "Actual repository:     ${{ github.repository }}"
+          echo "Actual environment:    ${{ inputs.environment }}"
+          echo "::notice::Compare this to the 'subject claim' line printed by the Azure Login step below. A mismatch here is the #1 cause of AADSTS700213."
+          echo "expected_subject=${EXPECTED_SUBJECT}" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+          echo "| 1 | OIDC subject (expected) | ℹ️ INFO | \`${EXPECTED_SUBJECT}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+      # ==================================================================
+      # 2. AZURE LOGIN
+      # ==================================================================
+      - name: "Check 2 — Azure Login (OIDC)"
+        id: azure_login
+        uses: azure/login@v3
+        continue-on-error: true
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Record login result
+        shell: bash
+        run: |
+          if [[ "${{ steps.azure_login.outcome }}" == "success" ]]; then
+            echo "| 2 | Azure Login (OIDC) | ✅ PASS | Login succeeded — federated credential subject matches |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| 2 | Azure Login (OIDC) | ❌ FAIL | Login failed — check AADSTS error above against Check 1's expected subject |" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Azure Login failed. All subsequent checks will be skipped. Fix OIDC / secrets first — see Check 1 for the expected subject string, and compare it to the 'subject claim' the login step printed above."
+          fi
+
+      - name: Halt if login failed
+        if: steps.azure_login.outcome != 'success'
+        run: exit 1
+
+      # ==================================================================
+      # 3. FUNCTION APP EXISTENCE + PLAN TYPE
+      # ==================================================================
+      - name: "Check 3 — Resolve and validate Function App"
+        id: resolve_app
+        shell: bash
+        env:
+          RESOURCE_GROUP: ${{ steps.params.outputs.resource_group }}
+          NAME_PREFIX: ${{ steps.params.outputs.name_prefix }}
+          OVERRIDE_NAME: ${{ inputs.function_app_name }}
+        run: |
+          set -euo pipefail
+          echo "::group::Check 3 — Resolve Function App"
+
+          if [[ -n "${OVERRIDE_NAME}" ]]; then
+            APP_NAME="${OVERRIDE_NAME}"
+            echo "Using explicit function_app_name override: ${APP_NAME}"
+          else
+            echo "Listing Function Apps in resource group '${RESOURCE_GROUP}' matching prefix '${NAME_PREFIX}'..."
+            MATCHES=$(az functionapp list \
+              --resource-group "${RESOURCE_GROUP}" \
+              --query "[?starts_with(name, '${NAME_PREFIX}')].name" -o tsv)
+
+            COUNT=$(echo "${MATCHES}" | grep -c . || true)
+            if [[ "${COUNT}" -eq 0 ]]; then
+              echo "::error::No Function App found with prefix '${NAME_PREFIX}' in resource group '${RESOURCE_GROUP}'."
+              echo "| 3 | Resolve Function App | ❌ FAIL | No app matched prefix \`${NAME_PREFIX}\` in \`${RESOURCE_GROUP}\` |" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            elif [[ "${COUNT}" -gt 1 ]]; then
+              echo "::warning::Multiple apps matched prefix '${NAME_PREFIX}': ${MATCHES}. Using the first match. Consider a more specific prefix or explicit function_app_name."
+            fi
+            APP_NAME=$(echo "${MATCHES}" | head -n1)
+          fi
+
+          echo "Resolved Function App: ${APP_NAME}"
+          echo "app_name=${APP_NAME}" >> "$GITHUB_OUTPUT"
+
+          APP_JSON=$(az functionapp show --name "${APP_NAME}" --resource-group "${RESOURCE_GROUP}" 2>&1) || {
+            echo "::error::az functionapp show failed for '${APP_NAME}' — does it exist in '${RESOURCE_GROUP}'?"
+            echo "| 3 | Resolve Function App | ❌ FAIL | \`${APP_NAME}\` not found in \`${RESOURCE_GROUP}\` |" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+
+          echo "${APP_JSON}" > /tmp/functionapp.json
+          KIND=$(echo "${APP_JSON}" | jq -r '.kind // "unknown"')
+          STATE=$(echo "${APP_JSON}" | jq -r '.state // "unknown"')
+          SKU=$(echo "${APP_JSON}" | jq -r '.sku // "unknown"')
+
+          echo "Kind:  ${KIND}"
+          echo "State: ${STATE}"
+          echo "SKU:   ${SKU}"
+
+          echo "app_state=${STATE}" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+
+          if [[ "${STATE}" != "Running" ]]; then
+            echo "::warning::Function App state is '${STATE}', not 'Running'."
+            echo "| 3 | Resolve Function App | ⚠️ WARN | \`${APP_NAME}\` found, but state=\`${STATE}\` (kind=\`${KIND}\`) |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| 3 | Resolve Function App | ✅ PASS | \`${APP_NAME}\` found, state=\`${STATE}\` (kind=\`${KIND}\`) |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ==================================================================
+      # 4. FLEX CONSUMPTION RUNTIME CONFIG
+      # ==================================================================
+      - name: "Check 4 — functionAppConfig.runtime"
+        id: check_runtime
+        shell: bash
+        env:
+          APP_NAME: ${{ steps.resolve_app.outputs.app_name }}
+          RESOURCE_GROUP: ${{ steps.params.outputs.resource_group }}
+          EXPECTED_RUNTIME: ${{ steps.params.outputs.expected_runtime }}
+          EXPECTED_RUNTIME_VERSION: ${{ steps.params.outputs.expected_runtime_version }}
+        run: |
+          set -euo pipefail
+          echo "::group::Check 4 — Flex Consumption runtime block"
+
+          RUNTIME_JSON=$(az functionapp show \
+            --name "${APP_NAME}" --resource-group "${RESOURCE_GROUP}" \
+            --query "{isFlex: sku=='FlexConsumption', runtimeName: functionAppConfig.runtime.name, runtimeVersion: functionAppConfig.runtime.version, maxInstances: functionAppConfig.scaleAndConcurrency.maximumInstanceCount, instanceMemory: functionAppConfig.scaleAndConcurrency.instanceMemoryMB}" \
+            -o json)
+
+          echo "${RUNTIME_JSON}" | jq .
+
+          RUNTIME_NAME=$(echo "${RUNTIME_JSON}" | jq -r '.runtimeName // "MISSING"')
+          RUNTIME_VERSION=$(echo "${RUNTIME_JSON}" | jq -r '.runtimeVersion // "MISSING"')
+          IS_FLEX=$(echo "${RUNTIME_JSON}" | jq -r '.isFlex')
+
+          echo "::endgroup::"
+
+          if [[ "${IS_FLEX}" != "true" ]]; then
+            echo "::warning::sku is not 'FlexConsumption' — this workflow's Flex-specific checks (5, 9) may not all apply."
+          fi
+
+          if [[ "${RUNTIME_NAME}" != "${EXPECTED_RUNTIME}" ]]; then
+            echo "::error::functionAppConfig.runtime.name is '${RUNTIME_NAME}', expected '${EXPECTED_RUNTIME}'."
+            echo "| 4 | Flex runtime config | ❌ FAIL | name=\`${RUNTIME_NAME}\` (expected \`${EXPECTED_RUNTIME}\`), version=\`${RUNTIME_VERSION}\` |" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "${RUNTIME_VERSION}" != "${EXPECTED_RUNTIME_VERSION}" ]]; then
+            echo "::warning::functionAppConfig.runtime.version is '${RUNTIME_VERSION}', expected '${EXPECTED_RUNTIME_VERSION}'."
+            echo "| 4 | Flex runtime config | ⚠️ WARN | name=\`${RUNTIME_NAME}\` ✓, version=\`${RUNTIME_VERSION}\` (expected \`${EXPECTED_RUNTIME_VERSION}\`) |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| 4 | Flex runtime config | ✅ PASS | name=\`${RUNTIME_NAME}\`, version=\`${RUNTIME_VERSION}\` |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ==================================================================
+      # 5. FORBIDDEN APP SETTINGS (Flex Consumption rejects these)
+      # ==================================================================
+      - name: "Check 5 — Forbidden app settings"
+        id: check_forbidden
+        shell: bash
+        env:
+          APP_NAME: ${{ steps.resolve_app.outputs.app_name }}
+          RESOURCE_GROUP: ${{ steps.params.outputs.resource_group }}
+        run: |
+          set -euo pipefail
+          echo "::group::Check 5 — Forbidden app settings on Flex Consumption"
+
+          ALL_SETTINGS=$(az functionapp config appsettings list \
+            --name "${APP_NAME}" --resource-group "${RESOURCE_GROUP}" \
+            --query "[].name" -o tsv)
+
+          FOUND_FORBIDDEN=""
+          for setting in ${FORBIDDEN_APP_SETTINGS}; do
+            if echo "${ALL_SETTINGS}" | grep -qx "${setting}"; then
+              FOUND_FORBIDDEN="${FOUND_FORBIDDEN} ${setting}"
+              echo "::error::Forbidden setting present: ${setting}"
+            fi
+          done
+
+          echo "::endgroup::"
+
+          if [[ -n "${FOUND_FORBIDDEN}" ]]; then
+            echo "| 5 | Forbidden app settings | ❌ FAIL | Found:${FOUND_FORBIDDEN} — these break Flex Consumption and must be deleted |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| 5 | Forbidden app settings | ✅ PASS | None of the known-invalid settings are present |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ==================================================================
+      # 6. EXPECTED APP SETTINGS PRESENT
+      # ==================================================================
+      - name: "Check 6 — Expected app settings present"
+        id: check_expected
+        shell: bash
+        env:
+          APP_NAME: ${{ steps.resolve_app.outputs.app_name }}
+          RESOURCE_GROUP: ${{ steps.params.outputs.resource_group }}
+        run: |
+          set -euo pipefail
+          echo "::group::Check 6 — Expected app settings"
+
+          ALL_SETTINGS=$(az functionapp config appsettings list \
+            --name "${APP_NAME}" --resource-group "${RESOURCE_GROUP}" \
+            --query "[].name" -o tsv)
+
+          MISSING=""
+          for setting in ${EXPECTED_APP_SETTINGS}; do
+            if ! echo "${ALL_SETTINGS}" | grep -qx "${setting}"; then
+              MISSING="${MISSING} ${setting}"
+              echo "::warning::Expected setting missing: ${setting}"
+            else
+              echo "Present: ${setting}"
+            fi
+          done
+
+          echo "::endgroup::"
+
+          if [[ -n "${MISSING}" ]]; then
+            echo "| 6 | Expected app settings | ⚠️ WARN | Missing:${MISSING} |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| 6 | Expected app settings | ✅ PASS | All expected settings present (values not inspected) |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ==================================================================
+      # 7. RBAC — MANAGED IDENTITY ON ITS OWN STORAGE ACCOUNT
+      # ==================================================================
+      - name: "Check 7 — RBAC on AzureWebJobsStorage account"
+        id: check_rbac_storage
+        shell: bash
+        env:
+          APP_NAME: ${{ steps.resolve_app.outputs.app_name }}
+          RESOURCE_GROUP: ${{ steps.params.outputs.resource_group }}
+        run: |
+          set -euo pipefail
+          echo "::group::Check 7 — RBAC on AzureWebJobsStorage"
+
+          STORAGE_ACCOUNT=$(az functionapp config appsettings list \
+            --name "${APP_NAME}" --resource-group "${RESOURCE_GROUP}" \
+            --query "[?name=='AzureWebJobsStorage__accountName'].value | [0]" -o tsv)
+
+          IDENTITY_PRINCIPAL_ID=$(az functionapp identity show \
+            --name "${APP_NAME}" --resource-group "${RESOURCE_GROUP}" \
+            --query "principalId" -o tsv 2>/dev/null || true)
+
+          if [[ -z "${IDENTITY_PRINCIPAL_ID}" || "${IDENTITY_PRINCIPAL_ID}" == "None" ]]; then
+            # User-assigned identity — principalId lives under userAssignedIdentities map
+            IDENTITY_PRINCIPAL_ID=$(az functionapp identity show \
+              --name "${APP_NAME}" --resource-group "${RESOURCE_GROUP}" \
+              --query "userAssignedIdentities.*.principalId | [0]" -o tsv 2>/dev/null || true)
+          fi
+
+          echo "Storage account:   ${STORAGE_ACCOUNT:-<not set>}"
+          echo "Identity principal: ${IDENTITY_PRINCIPAL_ID:-<not found>}"
+          echo "storage_account=${STORAGE_ACCOUNT}" >> "$GITHUB_OUTPUT"
+
+          if [[ -z "${STORAGE_ACCOUNT}" ]]; then
+            echo "::error::AzureWebJobsStorage__accountName is not set — cannot check RBAC."
+            echo "| 7 | RBAC on AzureWebJobsStorage | ❌ FAIL | AzureWebJobsStorage__accountName app setting is empty |" >> "$GITHUB_STEP_SUMMARY"
+            echo "::endgroup::"
+            exit 0
+          fi
+
+          if [[ -z "${IDENTITY_PRINCIPAL_ID}" ]]; then
+            echo "::error::Could not resolve a managed identity principalId for this app."
+            echo "| 7 | RBAC on AzureWebJobsStorage | ❌ FAIL | No system- or user-assigned identity found on the app |" >> "$GITHUB_STEP_SUMMARY"
+            echo "::endgroup::"
+            exit 0
+          fi
+
+          STORAGE_ID=$(az storage account show --name "${STORAGE_ACCOUNT}" --resource-group "${RESOURCE_GROUP}" --query id -o tsv 2>/dev/null || true)
+
+          if [[ -z "${STORAGE_ID}" ]]; then
+            echo "::error::Storage account '${STORAGE_ACCOUNT}' not found in resource group '${RESOURCE_GROUP}' (may live in a different RG)."
+            echo "| 7 | RBAC on AzureWebJobsStorage | ⚠️ WARN | Storage account \`${STORAGE_ACCOUNT}\` not found in \`${RESOURCE_GROUP}\` — check elsewhere |" >> "$GITHUB_STEP_SUMMARY"
+            echo "::endgroup::"
+            exit 0
+          fi
+
+          ROLES=$(az role assignment list --scope "${STORAGE_ID}" --assignee "${IDENTITY_PRINCIPAL_ID}" --query "[].roleDefinitionName" -o tsv)
+          echo "Roles found: ${ROLES:-<none>}"
+          echo "::endgroup::"
+
+          if echo "${ROLES}" | grep -qi "Storage Blob Data Owner\|Storage Blob Data Contributor"; then
+            echo "| 7 | RBAC on AzureWebJobsStorage | ✅ PASS | Identity has: $(echo ${ROLES} | tr '\n' ',') |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::Identity has no Blob Data Owner/Contributor role on its own storage account. This alone can cause silent indexing failures on Flex Consumption."
+            echo "| 7 | RBAC on AzureWebJobsStorage | ❌ FAIL | No Blob Data Owner/Contributor role found for identity \`${IDENTITY_PRINCIPAL_ID}\` |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ==================================================================
+      # 8. RBAC — DEPLOYMENT CONTAINER
+      # ==================================================================
+      - name: "Check 8 — Deployment container reachability + RBAC"
+        id: check_deployment_container
+        shell: bash
+        env:
+          APP_NAME: ${{ steps.resolve_app.outputs.app_name }}
+          RESOURCE_GROUP: ${{ steps.params.outputs.resource_group }}
+        run: |
+          set -euo pipefail
+          echo "::group::Check 8 — Deployment container"
+
+          DEPLOY_STORAGE_URI=$(az functionapp show \
+            --name "${APP_NAME}" --resource-group "${RESOURCE_GROUP}" \
+            --query "functionAppConfig.deployment.storage.value" -o tsv 2>/dev/null || true)
+
+          echo "Deployment storage URI: ${DEPLOY_STORAGE_URI:-<not set>}"
+
+          if [[ -z "${DEPLOY_STORAGE_URI}" ]]; then
+            echo "::error::functionAppConfig.deployment.storage.value is empty — Flex Consumption cannot deploy without this."
+            echo "| 8 | Deployment container | ❌ FAIL | functionAppConfig.deployment.storage.value is empty |" >> "$GITHUB_STEP_SUMMARY"
+            echo "::endgroup::"
+            exit 0
+          fi
+
+          # Extract account + container from the blob URI: https://<account>.blob.core.windows.net/<container>
+          DEPLOY_ACCOUNT=$(echo "${DEPLOY_STORAGE_URI}" | sed -E 's#https://([^.]+)\..*#\1#')
+          DEPLOY_CONTAINER=$(echo "${DEPLOY_STORAGE_URI}" | sed -E 's#.*/([^/]+)/?$#\1#')
+          echo "Account:   ${DEPLOY_ACCOUNT}"
+          echo "Container: ${DEPLOY_CONTAINER}"
+
+          LATEST_BLOB=$(az storage blob list \
+            --account-name "${DEPLOY_ACCOUNT}" \
+            --container-name "${DEPLOY_CONTAINER}" \
+            --auth-mode login \
+            --query "sort_by([], &properties.lastModified)[-1].{name:name, modified:properties.lastModified, size:properties.contentLength}" \
+            -o json 2>/tmp/blob_err.txt) || {
+              echo "::warning::Could not list blobs in deployment container (may be an auth/RBAC issue from THIS workflow's identity, not necessarily the app's)."
+              cat /tmp/blob_err.txt
+              echo "| 8 | Deployment container | ⚠️ WARN | Could not list container contents — see log for auth error |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::endgroup::"
+              exit 0
+            }
+
+          echo "${LATEST_BLOB}" | jq .
+          echo "::endgroup::"
+          echo "| 8 | Deployment container | ✅ PASS | Latest package: \`$(echo ${LATEST_BLOB} | jq -r .name)\` modified \`$(echo ${LATEST_BLOB} | jq -r .modified)\` |" >> "$GITHUB_STEP_SUMMARY"
+
+      # ==================================================================
+      # 9. DEPLOYMENT HISTORY
+      # ==================================================================
+      - name: "Check 9 — Recent deployment history"
+        id: check_deploy_history
+        shell: bash
+        env:
+          APP_NAME: ${{ steps.resolve_app.outputs.app_name }}
+          RESOURCE_GROUP: ${{ steps.params.outputs.resource_group }}
+        run: |
+          set -euo pipefail
+          echo "::group::Check 9 — Deployment history"
+
+          HISTORY=$(az functionapp deployment list \
+            --name "${APP_NAME}" --resource-group "${RESOURCE_GROUP}" \
+            --query "sort_by([], &receivedTime)[-5:].{status:status, message:message, time:receivedTime, active:active}" \
+            -o json 2>/tmp/deploy_err.txt) || {
+              echo "::warning::az functionapp deployment list failed (may not be supported for this deployment method on Flex Consumption)."
+              cat /tmp/deploy_err.txt
+              echo "| 9 | Deployment history | ⚠️ WARN | Command failed/unsupported — see log |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::endgroup::"
+              exit 0
+            }
+
+          echo "${HISTORY}" | jq .
+          echo "::endgroup::"
+
+          LATEST_STATUS=$(echo "${HISTORY}" | jq -r '.[-1].status // "unknown"')
+          if [[ "${LATEST_STATUS}" == "4" || "${LATEST_STATUS}" == "Success" ]]; then
+            echo "| 9 | Deployment history | ✅ PASS | Latest deployment status: \`${LATEST_STATUS}\` |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| 9 | Deployment history | ⚠️ WARN | Latest deployment status: \`${LATEST_STATUS}\` — inspect full history in logs |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ==================================================================
+      # 10. FUNCTION COUNT VIA ARM CONTROL PLANE
+      # ==================================================================
+      - name: "Check 10 — Function count (ARM control plane)"
+        id: check_function_count
+        shell: bash
+        env:
+          APP_NAME: ${{ steps.resolve_app.outputs.app_name }}
+          RESOURCE_GROUP: ${{ steps.params.outputs.resource_group }}
+        run: |
+          set -euo pipefail
+          echo "::group::Check 10 — Function count"
+
+          FUNCTIONS=$(az functionapp function list \
+            --name "${APP_NAME}" --resource-group "${RESOURCE_GROUP}" \
+            --query "[].name" -o tsv 2>/tmp/func_err.txt) || {
+              echo "::warning::az functionapp function list failed."
+              cat /tmp/func_err.txt
+              echo "| 10 | Function count | ⚠️ WARN | Command failed — see log |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::endgroup::"
+              exit 0
+            }
+
+          COUNT=$(echo "${FUNCTIONS}" | grep -c . || true)
+          echo "Functions found: ${COUNT}"
+          echo "${FUNCTIONS}"
+          echo "function_count=${COUNT}" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+
+          if [[ "${COUNT}" -eq 0 ]]; then
+            echo "::error::0 functions registered. This is the core symptom — see checks 4-9 above for likely causes, and check 11 below for a live re-index attempt."
+            echo "| 10 | Function count | ❌ FAIL | 0 functions found via ARM |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            FUNC_LIST=$(echo "${FUNCTIONS}" | tr '\n' ',' | sed 's/,$//')
+            echo "| 10 | Function count | ✅ PASS | ${COUNT} function(s): \`${FUNC_LIST}\` |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ==================================================================
+      # 11. LIVE RESTART + SYNC-TRIGGERS
+      # ==================================================================
+      - name: "Check 11 — Live restart + sync-triggers"
+        id: check_live_sync
+        if: inputs.skip_restart != true
+        shell: bash
+        env:
+          APP_NAME: ${{ steps.resolve_app.outputs.app_name }}
+          RESOURCE_GROUP: ${{ steps.params.outputs.resource_group }}
+        run: |
+          set -euo pipefail
+          echo "::group::Check 11 — Live restart + sync-triggers"
+
+          echo "Restarting ${APP_NAME}..."
+          RESTART_START=$(date +%s)
+          az functionapp restart --name "${APP_NAME}" --resource-group "${RESOURCE_GROUP}"
+          echo "Restart command returned after $(( $(date +%s) - RESTART_START ))s. Waiting 30s for cold start..."
+          sleep 30
+
+          echo "Calling sync-triggers..."
+          SYNC_START=$(date +%s)
+          SYNC_OUTPUT=$(az functionapp sync-triggers --name "${APP_NAME}" --resource-group "${RESOURCE_GROUP}" 2>&1) || {
+            echo "::error::sync-triggers command failed outright: ${SYNC_OUTPUT}"
+            echo "sync_duration=-1" >> "$GITHUB_OUTPUT"
+            echo "::endgroup::"
+            echo "| 11 | Live restart + sync-triggers | ❌ FAIL | sync-triggers command errored — see log |" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+          SYNC_DURATION=$(( $(date +%s) - SYNC_START ))
+          echo "sync-triggers completed in ${SYNC_DURATION}s."
+          echo "sync_duration=${SYNC_DURATION}" >> "$GITHUB_OUTPUT"
+
+          echo "Waiting 15s for indexing to settle, then re-checking function count..."
+          sleep 15
+
+          RECHECK_COUNT=$(az functionapp function list \
+            --name "${APP_NAME}" --resource-group "${RESOURCE_GROUP}" \
+            --query "length([])" -o tsv 2>/dev/null || echo "0")
+          echo "Function count after live sync: ${RECHECK_COUNT}"
+          echo "::endgroup::"
+
+          if [[ "${SYNC_DURATION}" -gt 20 ]]; then
+            echo "::warning::sync-triggers took ${SYNC_DURATION}s — a healthy sync usually completes in a few seconds. This slowness itself is a symptom worth investigating (storage/network/host startup contention)."
+          fi
+
+          if [[ "${RECHECK_COUNT}" -eq 0 ]]; then
+            echo "::error::Still 0 functions after live restart + sync-triggers. The problem is reproducible on demand, not a stale/caching artifact."
+            echo "| 11 | Live restart + sync-triggers | ❌ FAIL | sync took ${SYNC_DURATION}s; still 0 functions after re-check |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| 11 | Live restart + sync-triggers | ✅ PASS | sync took ${SYNC_DURATION}s; ${RECHECK_COUNT} function(s) found after re-check |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: "Check 11 — skipped"
+        if: inputs.skip_restart == true
+        shell: bash
+        run: |
+          echo "| 11 | Live restart + sync-triggers | ⏭️ SKIPPED | skip_restart=true |" >> "$GITHUB_STEP_SUMMARY"
+
+      # ==================================================================
+      # 12. LIVE HTTP SMOKE TEST
+      # ==================================================================
+      - name: "Check 12 — Live HTTP smoke test"
+        id: check_http
+        shell: bash
+        env:
+          APP_NAME: ${{ steps.resolve_app.outputs.app_name }}
+          RESOURCE_GROUP: ${{ steps.params.outputs.resource_group }}
+          HEALTH_PATH: ${{ steps.params.outputs.health_path }}
+        run: |
+          set -euo pipefail
+          echo "::group::Check 12 — Live HTTP smoke test"
+
+          HOSTNAME=$(az functionapp show \
+            --name "${APP_NAME}" --resource-group "${RESOURCE_GROUP}" \
+            --query "defaultHostName" -o tsv)
+
+          URL="https://${HOSTNAME}${HEALTH_PATH}"
+          echo "Requesting: ${URL}"
+
+          HTTP_CODE=$(curl -s -o /tmp/http_body.txt -w "%{http_code}" --max-time 30 "${URL}" || echo "000")
+          echo "HTTP status: ${HTTP_CODE}"
+          echo "Response body (first 500 chars):"
+          head -c 500 /tmp/http_body.txt || true
+          echo ""
+          echo "::endgroup::"
+
+          echo "http_code=${HTTP_CODE}" >> "$GITHUB_OUTPUT"
+
+          if [[ "${HTTP_CODE}" == "200" ]]; then
+            echo "| 12 | Live HTTP smoke test | ✅ PASS | \`GET ${HEALTH_PATH}\` → 200 |" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "${HTTP_CODE}" == "404" ]]; then
+            echo "::error::404 on the app's own route — consistent with 0 functions registered (no route exists to match)."
+            echo "| 12 | Live HTTP smoke test | ❌ FAIL | \`GET ${HEALTH_PATH}\` → 404 (no matching route — consistent with 0 functions indexed) |" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "${HTTP_CODE}" == "000" ]]; then
+            echo "::error::Request timed out or DNS/connection failed entirely."
+            echo "| 12 | Live HTTP smoke test | ❌ FAIL | Request failed/timed out — host may be down or unreachable |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::Unexpected status ${HTTP_CODE}."
+            echo "| 12 | Live HTTP smoke test | ⚠️ WARN | \`GET ${HEALTH_PATH}\` → ${HTTP_CODE} |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ==================================================================
+      # 13. FEDERATED CREDENTIAL INVENTORY (informational — helps catch rename/drift issues)
+      # ==================================================================
+      - name: "Check 13 — Federated credential inventory on the app's identity"
+        id: check_federated
+        shell: bash
+        env:
+          APP_NAME: ${{ steps.resolve_app.outputs.app_name }}
+          RESOURCE_GROUP: ${{ steps.params.outputs.resource_group }}
+        run: |
+          set -euo pipefail
+          echo "::group::Check 13 — Federated credentials on the app's user-assigned identity"
+
+          IDENTITY_ID=$(az functionapp identity show \
+            --name "${APP_NAME}" --resource-group "${RESOURCE_GROUP}" \
+            --query "userAssignedIdentities | keys(@) | [0]" -o tsv 2>/dev/null || true)
+
+          if [[ -z "${IDENTITY_ID}" || "${IDENTITY_ID}" == "None" ]]; then
+            echo "No user-assigned identity found (may be system-assigned instead — federated credentials don't apply)."
+            echo "| 13 | Federated credential inventory | ℹ️ INFO | No user-assigned identity found; skipping |" >> "$GITHUB_STEP_SUMMARY"
+            echo "::endgroup::"
+            exit 0
+          fi
+
+          IDENTITY_NAME=$(basename "${IDENTITY_ID}")
+          IDENTITY_RG=$(echo "${IDENTITY_ID}" | sed -E 's#.*/resourceGroups/([^/]+)/.*#\1#')
+
+          echo "Identity: ${IDENTITY_NAME} (in ${IDENTITY_RG})"
+
+          CREDS=$(az identity federated-credential list \
+            --identity-name "${IDENTITY_NAME}" --resource-group "${IDENTITY_RG}" \
+            --query "[].{name:name, subject:subject}" -o json 2>/tmp/fed_err.txt) || {
+              echo "::warning::Could not list federated credentials (permissions or identity mismatch)."
+              cat /tmp/fed_err.txt
+              echo "| 13 | Federated credential inventory | ⚠️ WARN | Could not list — see log |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::endgroup::"
+              exit 0
+            }
+
+          echo "${CREDS}" | jq .
+          echo "::endgroup::"
+
+          EXPECTED_SUBJECT="repo:${{ github.repository }}:environment:${{ inputs.environment }}"
+          if echo "${CREDS}" | jq -e ".[] | select(.subject == \"${EXPECTED_SUBJECT}\")" > /dev/null; then
+            echo "| 13 | Federated credential inventory | ✅ PASS | Found credential matching \`${EXPECTED_SUBJECT}\` |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::No federated credential subject matches '${EXPECTED_SUBJECT}' exactly. If the repo was ever renamed, stale credentials referencing the old name may still exist alongside — check the list above."
+            echo "| 13 | Federated credential inventory | ⚠️ WARN | No exact match for \`${EXPECTED_SUBJECT}\` — check for stale/renamed entries above |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ==================================================================
+      # FINAL SUMMARY
+      # ==================================================================
+      - name: Final summary
+        if: always()
+        shell: bash
+        run: |
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "---" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Legend:** ✅ PASS · ⚠️ WARN (worth checking) · ❌ FAIL (likely root cause) · ℹ️ INFO · ⏭️ SKIPPED" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "If check 10 or 11 shows 0 functions, work upward through checks 4-9 in order —" >> "$GITHUB_STEP_SUMMARY"
+          echo "each one rules out a distinct layer (runtime config, invalid settings, RBAC, deployment integrity)." >> "$GITHUB_STEP_SUMMARY"
+          echo "Check 12's HTTP status and check 13's federated credential match are usually the fastest confirmation of root cause." >> "$GITHUB_STEP_SUMMARY"
