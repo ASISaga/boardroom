@@ -1,4 +1,4 @@
-# Diagnose Function App (Flex Consumption) — v3
+# Diagnose Function App (Flex Consumption) — v4
 #
 # REQUIRES: .github/scripts/diagnose_import_test.py alongside this file.
 # Both files must be committed to the repository together.
@@ -8,20 +8,43 @@
 #   functions not appearing in the Azure Portal on a Flex Consumption
 #   Python Function App. Each phase gates on the previous.
 #
-#   Phase A  Auth            OIDC claims + Azure login
-#   Phase B  App config      Plan type, runtime, app settings, RBAC
+#   Phase A  Auth            OIDC claims, Azure login, AND which identity we actually are
+#   Phase B  App config      Plan type, runtime, app settings, RBAC (account AND container
+#                            scope), identity cross-check, mTLS/client-cert requirement
 #   Phase C  Package         Download deployed zip, inspect contents, analyse function_app.py
 #   Phase D  Python import   Actually import function_app — exact traceback on failure
 #   Phase E  Live host       Admin ping, admin status, sync-triggers, function count
+#                            (mTLS-aware: distinguishes cert-required 403s from real failures)
 #   Phase F  Telemetry       Application Insights KQL for recent worker/import errors
-#   Phase G  Connectivity    HTTP smoke test on a real route
-#   Phase H  Auth inventory  Federated credential subject audit
+#   Phase G  Connectivity    HTTP smoke test on a real route (also mTLS-aware)
+#   Phase H  Auth inventory  Federated credential audit — explicitly detects the
+#                            "stale credential from before a repo rename" pattern
 #   Phase Z  Synthesis       Priority-ordered root-cause list with exact fix commands
 #
 # PHASE D IS THE MOST POWERFUL CHECK.
 #   It downloads the exact zip Azure is running, sets the same PYTHONPATH,
 #   and attempts the import — producing the real Python traceback rather than
 #   opaque "0 functions found / mismatched parameters" messages.
+#
+# LESSONS ENCODED FROM REAL DIAGNOSTIC RUNS (why v4 exists)
+#   • A role assignment can PASS at storage-account scope (B5) while the SAME
+#     identity still gets "permission denied" on a specific container. B6 checks
+#     container scope directly instead of assuming inheritance always works.
+#   • The identity a workflow authenticates as (AZURE_CLIENT_ID secret) is not
+#     guaranteed to be the same as the Function App's own runtime identity, even
+#     when both successfully log in. B1b cross-checks this explicitly — if they
+#     differ, every RBAC "PASS" earlier in the run only proves what the WORKFLOW
+#     can do, not what the APP can do.
+#   • clientCertMode=Required causes a platform-level 403 ("Client Certificate
+#     Required") on EVERY unauthenticated HTTP request — admin ping, admin status,
+#     the app's own routes — before the request ever reaches your code or the
+#     Functions runtime. This looks like "the app is broken" but is unrelated to
+#     function indexing. B7 detects it up front; E1/E2/G1 recognize the specific
+#     403 body text and report "inconclusive" instead of misattributing it.
+#   • A federated credential can exist and even let OTHER workflows log in
+#     successfully, while the SPECIFIC identity queried still only has a STALE
+#     credential referencing an old (pre-rename) repo name. H1 now explicitly
+#     diffs found subjects against the current repo name to catch this.
 #
 # WHY az REST INSTEAD OF SOME az CLI SUBCOMMANDS
 #   • az functionapp sync-triggers — does not exist in the CLI
@@ -30,9 +53,9 @@
 #     → replaced with az rest to the Kudu deployments API
 #   • az identity federated-credential list — may hit api-version mismatch
 #     → replaced with az rest with pinned api-version as fallback
-#   • az functionapp show JMESPath for functionAppConfig — varies by CLI version
-#     → full raw JSON is dumped first; multiple field paths tried; if all fail
-#       the raw dump shows you the correct path immediately
+#   • az functionapp show JMESPath for functionAppConfig / state / kind — varies
+#     by CLI version → full raw JSON is dumped first; multiple field paths tried;
+#     if all fail the raw dump shows you the correct path immediately
 #
 # HOW TO PORT TO ANOTHER APP
 #   Change the defaults in workflow_dispatch.inputs and the env: block below.
@@ -42,9 +65,14 @@
 #   The identity behind AZURE_CLIENT_ID must have:
 #     Reader               on the Function App + resource group
 #     Storage Blob Data
-#       Contributor        on the deployment blob container  (Phase C)
+#       Contributor        on the deployment blob container, GRANTED AT THAT
+#                           EXACT CONTAINER SCOPE (Phase B6 verifies this
+#                           directly — do not assume account-level roles
+#                           inherit down reliably)
 #     Website Contributor  on the Function App               (Phase E restart)
-#   These are exactly the roles the deploy workflow already grants.
+#     Directory.Read.All   (optional) — enables A3/B1b to resolve service
+#                           principal display names via Graph; without it,
+#                           the clientId-based comparison still works fine.
 
 name: Diagnose Function App (Flex Consumption)
 
@@ -238,6 +266,46 @@ jobs:
         if: steps.azure_login.outcome != 'success'
         run: exit 1
 
+      - name: "A3 · Record the identity this workflow actually authenticated as"
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::A3 — Workflow's authenticated identity"
+
+          # This is the definitive way to know which identity is really running
+          # this workflow's az commands — critical because the AZURE_CLIENT_ID
+          # secret may point to a DIFFERENT identity than the Function App's own
+          # runtime identity, even if both happen to log in successfully.
+          ACCOUNT_JSON=$(az account show -o json)
+          echo "${ACCOUNT_JSON}" | jq .
+
+          WORKFLOW_USER_NAME=$(echo "${ACCOUNT_JSON}" | jq -r '.user.name // "unknown"')
+          WORKFLOW_USER_TYPE=$(echo "${ACCOUNT_JSON}" | jq -r '.user.type // "unknown"')
+
+          echo ""
+          echo "Workflow authenticated as: ${WORKFLOW_USER_NAME} (type: ${WORKFLOW_USER_TYPE})"
+
+          # user.name for a service principal login is the appId (== clientId).
+          # This is what we compare against the Function App's runtime identity clientId in B1.
+          echo "workflow_client_id=${WORKFLOW_USER_NAME}" >> /tmp/diag_state.env
+
+          # Also resolve the service principal's display name and object ID for
+          # a human-readable cross-check, tolerating Graph API permission issues.
+          SP_INFO=$(az ad sp show --id "${WORKFLOW_USER_NAME}" \
+            --query "{displayName:displayName, id:id, appId:appId}" \
+            -o json 2>/tmp/sp_err.txt) || {
+              echo "::warning::Could not resolve service principal details via Graph API (may lack Directory.Read permissions). This is informational only — the clientId comparison in B1 is what matters."
+              cat /tmp/sp_err.txt
+              SP_INFO="{}"
+            }
+          echo "${SP_INFO}" | jq . 2>/dev/null || echo "${SP_INFO}"
+
+          SP_DISPLAY_NAME=$(echo "${SP_INFO}" | jq -r '.displayName // "unknown"' 2>/dev/null || echo "unknown")
+          echo "workflow_identity_display_name=${SP_DISPLAY_NAME}" >> /tmp/diag_state.env
+
+          echo "::endgroup::"
+          echo "| A | A3 Workflow identity | ℹ️ INFO | clientId=\`${WORKFLOW_USER_NAME}\` displayName=\`${SP_DISPLAY_NAME}\` — will be cross-checked against the Function App's runtime identity in B1 |" >> "$GITHUB_STEP_SUMMARY"
+
       # ══════════════════════════════════════════════════════════════════════
       # PHASE B — APP CONFIGURATION
       # ══════════════════════════════════════════════════════════════════════
@@ -282,10 +350,24 @@ jobs:
           echo "${FULL_JSON}" > /tmp/functionapp_full.json
           echo "${FULL_JSON}" | jq .
 
-          STATE=$(echo "${FULL_JSON}" | jq -r '.state // "unknown"')
-          KIND=$(echo "${FULL_JSON}" | jq -r '.kind // "unknown"')
+          # NOTE: .state and .kind can live at top-level OR under .properties depending
+          # on CLI version — same issue as functionAppConfig below. Try both, same pattern.
+          STATE=$(echo "${FULL_JSON}" | jq -r '.state // .properties.state // "unknown"')
+          KIND=$(echo "${FULL_JSON}" | jq -r '.kind // .properties.kind // "unknown"')
           echo "app_state=${STATE}" >> "$GITHUB_OUTPUT"
           echo "app_state_resolved=${STATE}" >> /tmp/diag_state.env
+
+          # Capture the Function App's runtime identity clientId(s) for the A3 cross-check.
+          RUNTIME_CLIENT_IDS=$(echo "${FULL_JSON}" | jq -r '
+            .identity.userAssignedIdentities // .properties.identity.userAssignedIdentities // {} |
+            to_entries[] | "\(.key)|\(.value.clientId)|\(.value.principalId)"' 2>/dev/null || true)
+          echo ""
+          echo "Runtime user-assigned identities (resourceId|clientId|principalId):"
+          echo "${RUNTIME_CLIENT_IDS}"
+          echo "runtime_identity_details<<EOF_IDENTITY" >> /tmp/diag_state.env
+          echo "${RUNTIME_CLIENT_IDS}" >> /tmp/diag_state.env
+          echo "EOF_IDENTITY" >> /tmp/diag_state.env
+
           echo "::endgroup::"
 
           if [[ "${STATE}" == "Running" ]]; then
@@ -294,6 +376,43 @@ jobs:
             echo "app_state_not_running=true" >> /tmp/diag_state.env
             echo "| B | B1 Resolve app | ⚠️ WARN | \`${APP_NAME}\` state=\`${STATE}\` (expected Running) — this alone can prevent indexing |" >> "$GITHUB_STEP_SUMMARY"
             echo "::warning::App state is '${STATE}', not Running."
+          fi
+
+      - name: "B1b · Cross-check workflow identity vs Function App runtime identity"
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /tmp/diag_state.env 2>/dev/null || true
+          echo "::group::B1b — Identity cross-check"
+
+          WORKFLOW_ID="${workflow_client_id:-}"
+          echo "Workflow authenticated as clientId: ${WORKFLOW_ID:-<unknown>}"
+          echo ""
+          echo "Function App runtime identity clientId(s):"
+          echo "${runtime_identity_details:-<none found>}"
+          echo ""
+
+          if [[ -z "${WORKFLOW_ID}" ]]; then
+            echo "::warning::Could not determine workflow's own clientId from A3 — skipping cross-check."
+            echo "| B | B1b Identity cross-check | ⚠️ WARN | Workflow clientId unknown — see A3 |" >> "$GITHUB_STEP_SUMMARY"
+            echo "::endgroup::"
+            exit 0
+          fi
+
+          if echo "${runtime_identity_details:-}" | grep -q "${WORKFLOW_ID}"; then
+            echo "identity_match=true" >> /tmp/diag_state.env
+            echo "✅ MATCH — this workflow is authenticated AS the Function App's own runtime identity."
+            echo "::endgroup::"
+            echo "| B | B1b Identity cross-check | ✅ PASS | Workflow identity IS the Function App's runtime identity — RBAC checks below reflect what the app itself can do |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "identity_mismatch=true" >> /tmp/diag_state.env
+            echo "❌ MISMATCH — this workflow authenticated as a DIFFERENT identity than the Function App's own runtime identity."
+            echo "   This means: RBAC checks in this workflow (e.g. B5, C1) test what THIS WORKFLOW's identity can do,"
+            echo "   which may differ from what the FUNCTION APP's own identity can do at runtime."
+            echo "   A role assignment existing for one identity does NOT imply it exists for the other."
+            echo "::warning::Workflow identity (${WORKFLOW_ID}) does not match any Function App runtime identity. RBAC results below may not reflect the app's actual runtime permissions."
+            echo "::endgroup::"
+            echo "| B | B1b Identity cross-check | ❌ FAIL | Workflow identity \`${WORKFLOW_ID}\` ≠ Function App runtime identity — RBAC checks (B5, C1) may show this workflow's permissions, NOT the app's own runtime permissions. See B1b log for details. |" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: "B2 · Plan type + functionAppConfig.runtime + deployment URI"
@@ -497,6 +616,128 @@ jobs:
           else
             echo "storage_rbac_missing=true" >> /tmp/diag_state.env
             echo "| B | B5 RBAC AzureWebJobsStorage | ❌ FAIL | No Blob Data Owner/Contributor found for identity \`${PRINCIPAL_ID}\` on \`${STORAGE_ACCOUNT}\` — silent indexing failures result |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: "B6 · RBAC on the DEPLOYMENT container specifically (not just the storage account)"
+        shell: bash
+        env:
+          APP_NAME: ${{ steps.resolve_app.outputs.app_name }}
+          RESOURCE_GROUP: ${{ steps.params.outputs.resource_group }}
+        run: |
+          set -euo pipefail
+          source /tmp/diag_state.env 2>/dev/null || true
+          echo "::group::B6 — Container-scoped RBAC (account-level roles do not always mean container-level access works)"
+
+          # WHY THIS CHECK EXISTS: an earlier run showed "Storage Blob Data Owner" at
+          # the storage-account scope (B5 passed) while `az storage blob list` on the
+          # SPECIFIC deployment container still failed with a permissions error.
+          # Account-scope role assignments should inherit down to containers, but this
+          # check verifies it directly rather than assuming — inheritance can be broken
+          # by resource locks, Deny assignments, ABAC conditions, or propagation delay.
+
+          DEPLOY_URI="${deploy_uri:-}"
+          if [[ -z "${DEPLOY_URI}" ]]; then
+            echo "No deployment URI available (B2) — skipping container-specific check."
+            echo "| B | B6 Container RBAC | ⏭️ SKIPPED | No deployment URI |" >> "$GITHUB_STEP_SUMMARY"
+            echo "::endgroup::"
+            exit 0
+          fi
+
+          ACCT=$(echo "${DEPLOY_URI}" | sed -E 's#https://([^.]+)\..*#\1#')
+          CONT=$(echo "${DEPLOY_URI}" | sed -E 's#.*/([^/]+)/?$#\1#')
+          CONTAINER_ID="/subscriptions/$(az account show --query id -o tsv)/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Storage/storageAccounts/${ACCT}/blobServices/default/containers/${CONT}"
+          echo "Container resource ID: ${CONTAINER_ID}"
+          echo ""
+
+          # Check 1: What roles does the Function App's OWN runtime identity have,
+          # scoped exactly to this container?
+          APP_PRINCIPAL="${app_principal_id:-}"
+          if [[ -n "${APP_PRINCIPAL}" ]]; then
+            echo "--- Roles for Function App runtime identity (${APP_PRINCIPAL}) at container scope ---"
+            APP_ROLES_AT_CONTAINER=$(az role assignment list \
+              --scope "${CONTAINER_ID}" \
+              --assignee "${APP_PRINCIPAL}" \
+              --include-inherited \
+              --query "[].{role:roleDefinitionName, scope:scope}" -o json 2>/tmp/b6_app_err.txt || echo "[]")
+            echo "${APP_ROLES_AT_CONTAINER}" | jq . 2>/dev/null || cat /tmp/b6_app_err.txt
+          fi
+
+          # Check 2: What roles does THIS WORKFLOW's identity have, scoped exactly
+          # to this container? (may differ from Check 1 if identity_mismatch=true)
+          WORKFLOW_ID_FOR_LOOKUP="${workflow_client_id:-}"
+          if [[ -n "${WORKFLOW_ID_FOR_LOOKUP}" ]]; then
+            WORKFLOW_PRINCIPAL=$(az ad sp show --id "${WORKFLOW_ID_FOR_LOOKUP}" --query id -o tsv 2>/dev/null || true)
+            echo ""
+            echo "--- Roles for THIS WORKFLOW's identity (clientId=${WORKFLOW_ID_FOR_LOOKUP}, principalId=${WORKFLOW_PRINCIPAL:-unknown}) at container scope ---"
+            if [[ -n "${WORKFLOW_PRINCIPAL}" ]]; then
+              WORKFLOW_ROLES_AT_CONTAINER=$(az role assignment list \
+                --scope "${CONTAINER_ID}" \
+                --assignee "${WORKFLOW_PRINCIPAL}" \
+                --include-inherited \
+                --query "[].{role:roleDefinitionName, scope:scope}" -o json 2>/tmp/b6_wf_err.txt || echo "[]")
+              echo "${WORKFLOW_ROLES_AT_CONTAINER}" | jq . 2>/dev/null || cat /tmp/b6_wf_err.txt
+              WORKFLOW_HAS_CONTAINER_ROLE=$(echo "${WORKFLOW_ROLES_AT_CONTAINER}" | jq 'length > 0' 2>/dev/null || echo "false")
+            else
+              echo "Could not resolve principalId for workflow identity."
+              WORKFLOW_HAS_CONTAINER_ROLE="unknown"
+            fi
+          fi
+
+          echo "::endgroup::"
+
+          APP_HAS_CONTAINER_ROLE=$(echo "${APP_ROLES_AT_CONTAINER:-[]}" | jq 'length > 0' 2>/dev/null || echo "false")
+
+          echo "container_rbac_app_identity=${APP_HAS_CONTAINER_ROLE}"       >> /tmp/diag_state.env
+          echo "container_rbac_workflow_identity=${WORKFLOW_HAS_CONTAINER_ROLE:-unknown}" >> /tmp/diag_state.env
+
+          if [[ "${APP_HAS_CONTAINER_ROLE}" != "true" ]]; then
+            echo "container_rbac_app_missing=true" >> /tmp/diag_state.env
+            echo "| B | B6 Container RBAC (app identity) | ❌ FAIL | Function App's own runtime identity has NO role assignment visible at the container scope — even if B5 (account scope) passed |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| B | B6 Container RBAC (app identity) | ✅ PASS | Function App's runtime identity has a role at container scope |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [[ "${WORKFLOW_HAS_CONTAINER_ROLE:-false}" != "true" ]]; then
+            echo "container_rbac_workflow_missing=true" >> /tmp/diag_state.env
+            echo "| B | B6 Container RBAC (workflow identity) | ⚠️ WARN | This workflow's own identity has no visible role at container scope — Phase C package download will likely fail |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| B | B6 Container RBAC (workflow identity) | ✅ PASS | This workflow's identity has a role at container scope — Phase C should be able to download the package |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: "B7 · Client certificate (mTLS) requirement — blocks ALL unauthenticated HTTP checks if Required"
+        shell: bash
+        run: |
+          set -euo pipefail
+          FULL_JSON=$(cat /tmp/functionapp_full.json)
+          echo "::group::B7 — mTLS / client certificate requirement"
+
+          # WHY THIS CHECK EXISTS: an earlier run showed every unauthenticated HTTP
+          # check (admin ping, admin status, admin functions list, and the app's own
+          # HTTP route) returning "403 Forbidden: Client Certificate Required" — a
+          # platform-level TLS rejection that happens BEFORE the request reaches the
+          # Functions runtime at all. This is unrelated to whether functions are
+          # indexed; it blocks ALL traffic, authenticated or not, that doesn't present
+          # a client cert. Flagging it here means Phases E/G below can correctly
+          # attribute a 403 to this cause rather than to app-level auth or routing.
+
+          CERT_ENABLED=$(echo "${FULL_JSON}" | jq -r '.clientCertEnabled // .properties.clientCertEnabled // "unknown"')
+          CERT_MODE=$(echo "${FULL_JSON}" | jq -r '.clientCertMode // .properties.clientCertMode // "unknown"')
+
+          echo "clientCertEnabled: ${CERT_ENABLED}"
+          echo "clientCertMode:    ${CERT_MODE}"
+          echo "::endgroup::"
+
+          echo "client_cert_enabled=${CERT_ENABLED}" >> /tmp/diag_state.env
+          echo "client_cert_mode=${CERT_MODE}"       >> /tmp/diag_state.env
+
+          if [[ "${CERT_ENABLED}" == "true" && "${CERT_MODE}" == "Required" ]]; then
+            echo "client_cert_blocking=true" >> /tmp/diag_state.env
+            echo "::warning::clientCertMode=Required. Every unauthenticated HTTPS request — including this workflow's own smoke tests below AND real user/API traffic — will receive 403 'Client Certificate Required' before reaching your code. If this is unintentional, real production traffic is currently being rejected."
+            echo "| B | B7 Client certificate requirement | ❌ FAIL | clientCertEnabled=\`true\`, clientCertMode=\`Required\` — ALL unauthenticated HTTP traffic (including E1/E2/G1 checks below, and real users) gets 403 before reaching your code |" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "${CERT_ENABLED}" == "true" && "${CERT_MODE}" == "Optional" ]]; then
+            echo "| B | B7 Client certificate requirement | ⚠️ WARN | clientCertEnabled=\`true\`, clientCertMode=\`Optional\` — requests without a cert are allowed through, but confirm this is intended |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| B | B7 Client certificate requirement | ✅ PASS | clientCertEnabled=\`${CERT_ENABLED}\` — no mTLS blocking expected |" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       # ══════════════════════════════════════════════════════════════════════
@@ -804,6 +1045,16 @@ jobs:
           BODY=$(cat /tmp/ping_body.txt 2>/dev/null | head -c 300 || true)
           echo "HTTP ${HTTP}: ${BODY}"
           echo "admin_ping_code=${HTTP}" >> /tmp/diag_state.env
+
+          # A 403 body containing "Client Certificate Required" is a platform-level
+          # mTLS rejection (see B7), not an app-level auth failure or routing problem.
+          # Distinguish it explicitly so it isn't misread as evidence about indexing.
+          if [[ "${HTTP}" == "403" ]] && echo "${BODY}" | grep -qi "client certificate"; then
+            echo "admin_ping_blocked_by_mtls=true" >> /tmp/diag_state.env
+            echo "| E | E1 Admin host ping | ⏭️ INCONCLUSIVE | 403 = mTLS client-certificate requirement (see B7), NOT an indexing signal — this check cannot run until B7 is fixed |" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
           case "${HTTP}" in
             200|401) echo "| E | E1 Admin host ping | ✅ PASS | \`/admin/host/ping\` → ${HTTP} (host is alive) |" >> "$GITHUB_STEP_SUMMARY" ;;
             000)     echo "admin_ping_failed=true" >> /tmp/diag_state.env
@@ -833,12 +1084,24 @@ jobs:
           fi
 
           # Host status
-          STATUS_JSON=$(curl -s --max-time 20 \
+          STATUS_RAW=$(curl -s --max-time 20 \
             "https://${HOSTNAME}/admin/host/status" \
             -H "x-functions-key: ${MASTER_KEY}" 2>/dev/null || echo "{}")
           echo "--- /admin/host/status ---"
-          echo "${STATUS_JSON}" | python3 -m json.tool 2>/dev/null || echo "${STATUS_JSON}"
+          echo "${STATUS_RAW}" | head -c 2000
 
+          # A client-cert-required response is HTML, not JSON — detect it before
+          # trying to parse, so this doesn't silently show as "state=unknown".
+          if echo "${STATUS_RAW}" | grep -qi "client certificate"; then
+            echo ""
+            echo "::warning::/admin/host/status returned an mTLS client-certificate-required page (see B7), not JSON. This check cannot evaluate host state until B7 is resolved."
+            echo "admin_status_blocked_by_mtls=true" >> /tmp/diag_state.env
+            echo "::endgroup::"
+            echo "| E | E2 Admin host status | ⏭️ INCONCLUSIVE | Blocked by mTLS client-certificate requirement (see B7) — not an indexing signal |" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          STATUS_JSON="${STATUS_RAW}"
           H_STATE=$(echo "${STATUS_JSON}" | jq -r '.state // "unknown"' 2>/dev/null || echo "unknown")
           H_ERRORS=$(echo "${STATUS_JSON}" | jq -r '.errors // [] | .[]' 2>/dev/null || true)
           echo "admin_host_state=${H_STATE}" >> /tmp/diag_state.env
@@ -1047,10 +1310,18 @@ jobs:
           echo "::group::G1 — HTTP smoke test"
           echo "Requesting: ${URL}"
           HTTP=$(curl -s -o /tmp/smoke_body.txt -w "%{http_code}" --max-time 30 "${URL}" 2>/dev/null || echo "000")
+          BODY=$(cat /tmp/smoke_body.txt 2>/dev/null | head -c 500 || true)
           echo "HTTP ${HTTP}"
-          cat /tmp/smoke_body.txt 2>/dev/null | head -c 500 || true
+          echo "${BODY}"
           echo "::endgroup::"
           echo "smoke_http_code=${HTTP}" >> /tmp/diag_state.env
+
+          if [[ "${HTTP}" == "403" ]] && echo "${BODY}" | grep -qi "client certificate"; then
+            echo "smoke_blocked_by_mtls=true" >> /tmp/diag_state.env
+            echo "| G | G1 HTTP smoke test | ⏭️ INCONCLUSIVE | 403 = mTLS client-certificate requirement (see B7) — real users hitting this route would see the same page. This is NOT evidence about function indexing. |" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
           case "${HTTP}" in
             200)  echo "| G | G1 HTTP smoke test | ✅ PASS | \`GET ${HEALTH_PATH}\` → 200 |" >> "$GITHUB_STEP_SUMMARY" ;;
             404)  echo "smoke_404=true" >> /tmp/diag_state.env
@@ -1108,13 +1379,36 @@ jobs:
           echo "::endgroup::"
 
           EXPECTED="repo:${{ github.repository }}:environment:${{ inputs.environment }}"
+          CRED_COUNT=$(echo "${CREDS}" | jq 'length' 2>/dev/null || echo "0")
+          ALL_SUBJECTS=$(echo "${CREDS}" | jq -r '.[].subject' 2>/dev/null | tr '\n' ';' || true)
+          echo "credential_count=${CRED_COUNT}" >> /tmp/diag_state.env
+          echo "credential_subjects=${ALL_SUBJECTS}" >> /tmp/diag_state.env
+
           if echo "${CREDS}" | jq -e ".[] | select(.subject == \"${EXPECTED}\")" >/dev/null 2>&1; then
-            echo "| H | H1 Federated credentials | ✅ PASS | Credential matching \`${EXPECTED}\` found |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| H | H1 Federated credentials | ✅ PASS | Credential matching \`${EXPECTED}\` found (${CRED_COUNT} total credential(s) on this identity) |" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "federated_cred_missing=true" >> /tmp/diag_state.env
             echo "federated_cred_expected=${EXPECTED}" >> /tmp/diag_state.env
             echo "::warning::No federated credential exactly matches '${EXPECTED}'."
-            echo "| H | H1 Federated credentials | ⚠️ WARN | No exact match for \`${EXPECTED}\` — stale/renamed entry or missing credential |" >> "$GITHUB_STEP_SUMMARY"
+
+            # Specifically detect the "stale repo rename" pattern: a credential exists
+            # for the SAME org + environment but a DIFFERENT repo name. This is the
+            # single most common real-world cause and deserves its own message rather
+            # than a generic "no match" warning.
+            CURRENT_REPO_NAME=$(echo "${{ github.repository }}" | cut -d/ -f2)
+            STALE_MATCH=$(echo "${CREDS}" | jq -r --arg env "${{ inputs.environment }}" --arg cur "${CURRENT_REPO_NAME}" '
+              .[] | select(.subject | test("environment:" + $env + "$")) |
+              select(.subject | test($cur) | not) | .subject' 2>/dev/null || true)
+
+            if [[ -n "${STALE_MATCH}" ]]; then
+              echo "federated_cred_stale_rename_detected=true" >> /tmp/diag_state.env
+              echo "federated_cred_stale_subject=${STALE_MATCH}" >> /tmp/diag_state.env
+              echo "::error::Found a credential for the same environment but a DIFFERENT repo name: '${STALE_MATCH}'. This strongly suggests the repo was renamed after this credential was created (this identity was likely provisioned when the repo was still named differently)."
+              echo "| H | H1 Federated credentials | ❌ FAIL | Found STALE credential from repo rename: \`${STALE_MATCH}\` — does not match current repo \`${{ github.repository }}\`. Add a new credential with the correct subject; do not assume the old one still works. |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              ALL_SUBJECTS_DISPLAY=$(echo "${ALL_SUBJECTS}" | sed 's/;/<br>/g')
+              echo "| H | H1 Federated credentials | ⚠️ WARN | No exact match for \`${EXPECTED}\`. Found ${CRED_COUNT} credential(s): ${ALL_SUBJECTS_DISPLAY:-none} |" >> "$GITHUB_STEP_SUMMARY"
+            fi
           fi
 
       # ══════════════════════════════════════════════════════════════════════
@@ -1156,6 +1450,22 @@ jobs:
             FIXES+=("${python_fix:-See the D1 step log for the full traceback and specific fix instructions.}")
           fi
 
+          if [[ "${client_cert_blocking:-}" == "true" ]]; then
+            CAUSES+=("🔴 P0  clientCertMode=Required — ALL unauthenticated HTTP traffic (real users, health checks, and this workflow's own smoke tests) is rejected with 403 before reaching your code. This affects production traffic independent of whether functions are indexed.")
+            FIXES+=("az functionapp update --name '${app_name_resolved:-APP_NAME}' --resource-group '${DEFAULT_RESOURCE_GROUP}' --set clientCertMode=Optional   (or clientCertEnabled=false if client certs are not needed at all)")
+          fi
+
+          # ── P0.5: Identity/RBAC ambiguity — must be resolved before trusting any RBAC PASS above ──
+          if [[ "${identity_mismatch:-}" == "true" ]]; then
+            CAUSES+=("🔴 P0  This workflow authenticated as a DIFFERENT identity than the Function App's own runtime identity. Every RBAC check above (B5, B6) reflects what THIS WORKFLOW's identity can do — NOT necessarily what the Function App's own identity can do at runtime. A ✅ PASS on B5/B6 does not guarantee the app itself has the same access.")
+            FIXES+=("Confirm which identity's clientId is actually set as the AZURE_CLIENT_ID secret for the '${{ inputs.environment }}' GitHub environment, and compare it against the Function App's runtime identity clientId shown in the B1 raw JSON dump. If they differ intentionally (e.g. a dedicated CI identity), re-run B5/B6-equivalent checks scoped to the APP's own principalId specifically, not the workflow's.")
+          fi
+
+          if [[ "${container_rbac_app_missing:-}" == "true" ]]; then
+            CAUSES+=("🟠 P1  The Function App's own runtime identity has no visible role assignment at the DEPLOYMENT CONTAINER scope, even though B5 (storage-account scope) may have passed. Account-level role assignments do not always guarantee container-level access — inheritance can be broken by scope-specific Deny assignments, ABAC conditions, resource locks, or propagation delay.")
+            FIXES+=("Grant the role explicitly at container scope: az role assignment create --role 'Storage Blob Data Contributor' --assignee-object-id '${app_principal_id:-PRINCIPAL_ID}' --scope '<container-resource-id-from-B6-log>'")
+          fi
+
           # ── P1: Strong causes ───────────────────────────────────────────
           if [[ "${found_register_blueprint:-}" == "true" ]]; then
             CAUSES+=("🔴 P1  function_app.py calls app.register_blueprint() which does NOT exist on func.FunctionApp — this raises AttributeError at import time and produces exactly '0 functions found'.")
@@ -1180,6 +1490,11 @@ jobs:
           if [[ "${package_missing_site_packages:-}" == "true" ]]; then
             CAUSES+=("🔴 P1  .python_packages/lib/site-packages/ is missing from the deployed zip — dependencies are not bundled.")
             FIXES+=("The deploy workflow's pip install --target=.python_packages/lib/site-packages step must run before packaging. Check the deploy workflow log for pip errors, and ensure .python_packages is not excluded by .funcignore.")
+          fi
+
+          if [[ "${federated_cred_stale_rename_detected:-}" == "true" ]]; then
+            CAUSES+=("🟠 P1  Found a federated credential from BEFORE a repo rename: '${federated_cred_stale_subject:-?}'. This identity was provisioned under the old repo name and has not been updated.")
+            FIXES+=("az identity federated-credential create --identity-name '<identity-name-from-H1-log>' --resource-group '<rg-from-H1-log>' --name 'github-\$(date +%s)' --issuer 'https://token.actions.githubusercontent.com' --subject '${federated_cred_expected:-repo:OWNER/REPO:environment:ENV}' --audiences 'api://AzureADTokenExchange'")
           fi
 
           # ── P2: Infrastructure/permissions ──────────────────────────────
