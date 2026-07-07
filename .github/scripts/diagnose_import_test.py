@@ -162,40 +162,86 @@ try:
         app = function_app.app
         print(f"   app type: {type(app).__qualname__}")
 
-        # Enumerate registered functions via multiple introspection paths
+        # Enumerate registered functions via the REAL documented public API.
+        # Microsoft's azure.functions.FunctionRegister class documents two
+        # public methods for this purpose: get_functions() and the
+        # functions_bindings dict property. Earlier versions of this script
+        # guessed at private attribute names (_function_builders etc.) which
+        # do not exist on this SDK version and produced a false "0 functions"
+        # result even when registration was actually successful. Try the
+        # documented public API first; only fall back to private-attribute
+        # guessing if the public API itself is unavailable (very old SDK).
         fn_count = 0
         fn_names = []
-        for attr in (
-            "_function_builders",
-            "_functions",
-            "_function_builders_dict",
-            "_function_builders_by_name",
-            "_functions_dict",
-        ):
-            val = getattr(app, attr, None)
-            if isinstance(val, dict) and val:
-                fn_count = len(val)
-                fn_names = list(val.keys())[:30]
-                print(f"   Registered functions (via app.{attr}): {fn_count}")
-                for name in fn_names:
-                    print(f"     - {name}")
-                break
+        found_via = None
+
+        if hasattr(app, "get_functions") and callable(getattr(app, "get_functions")):
+            try:
+                functions_list = app.get_functions()
+                if functions_list:
+                    fn_count = len(functions_list)
+                    # Function objects expose .get_function_name() in this SDK;
+                    # fall back to str() if that's not present.
+                    for f in functions_list[:30]:
+                        name = None
+                        for name_attr in ("get_function_name", "name", "function_name"):
+                            if hasattr(f, name_attr):
+                                candidate = getattr(f, name_attr)
+                                name = candidate() if callable(candidate) else candidate
+                                break
+                        fn_names.append(name or str(f))
+                    found_via = "get_functions()"
+            except Exception as exc:
+                print(f"   app.get_functions() raised {type(exc).__name__}: {exc}")
+
+        if fn_count == 0 and hasattr(app, "functions_bindings"):
+            try:
+                bindings = app.functions_bindings
+                if isinstance(bindings, dict) and bindings:
+                    fn_count = len(bindings)
+                    fn_names = list(bindings.keys())[:30]
+                    found_via = "functions_bindings"
+            except Exception as exc:
+                print(f"   app.functions_bindings raised {type(exc).__name__}: {exc}")
+
+        if fn_count == 0:
+            # Last-resort fallback: private attributes from older SDK internals.
+            for attr in (
+                "_function_builders",
+                "_functions",
+                "_function_builders_dict",
+                "_function_builders_by_name",
+                "_functions_dict",
+            ):
+                val = getattr(app, attr, None)
+                if isinstance(val, dict) and val:
+                    fn_count = len(val)
+                    fn_names = list(val.keys())[:30]
+                    found_via = f"legacy private attr app.{attr}"
+                    break
+
+        if found_via:
+            print(f"   Registered functions (via {found_via}): {fn_count}")
+            for name in fn_names:
+                print(f"     - {name}")
         else:
-            # Fallback: introspect for any function-shaped attrs
             candidates = [
                 a for a in dir(app)
                 if any(k in a.lower() for k in ("func", "blueprint", "builder", "trigger", "route"))
             ]
-            print(f"   Could not find function registry via standard attrs.")
+            print(f"   Could not find function registry via get_functions(), functions_bindings, or legacy attrs.")
             print(f"   Function-related app attributes: {candidates}")
 
         RESULT["registered_function_count"] = fn_count
         RESULT["registered_function_names"] = fn_names
+        RESULT["function_registry_source"] = found_via
 
         if fn_count == 0:
             RESULT["diagnosis"] = (
-                "function_app.py imported without error but 0 functions are registered "
-                "in the FunctionApp object. Blueprints may not be passed to register_functions()."
+                "function_app.py imported without error but 0 functions were found via "
+                "get_functions(), functions_bindings, AND legacy private attributes. "
+                "This is a strong signal — not just a script limitation — since the "
+                "documented public API was checked directly."
             )
             RESULT["fix"] = (
                 "Ensure every Blueprint is registered:\n"
@@ -206,7 +252,8 @@ try:
             )
             print(f"\n⚠️  Diagnosis: {RESULT['diagnosis']}")
         else:
-            print(f"\n✅ {fn_count} function(s) registered — import and registration are healthy.")
+            print(f"\n✅ {fn_count} function(s) registered (found via {found_via}) — import and registration are healthy.")
+
 
 except AttributeError as exc:
     tb = traceback.format_exc()
