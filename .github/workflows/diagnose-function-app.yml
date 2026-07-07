@@ -1001,34 +1001,55 @@ jobs:
           fi
 
           cd /tmp/pkg_extract
+          export DIAGNOSE_RESULT_FILE=/tmp/diagnose_import_result.json
+          rm -f "${DIAGNOSE_RESULT_FILE}"
           IMPORT_OUTPUT=$("${PYTHON_BIN}" "${SCRIPT}" 2>&1) || IMPORT_EXIT=$?
           IMPORT_EXIT=${IMPORT_EXIT:-0}
           echo "${IMPORT_OUTPUT}"
           cd - > /dev/null
 
-          # Parse the structured JSON result block printed at the end of the output.
-          # The script prints "=== STRUCTURED RESULTS ===" then a JSON object.
-          # We extract it with awk then parse with jq.
-          RESULT_JSON=$(echo "${IMPORT_OUTPUT}" | \
-            awk '/^{/{p=1} p{print} /^}/{p=0}' | \
-            head -1000 | \
-            python3 -c "import sys,json;d=sys.stdin.read();s=d.find('{');e=d.rfind('}');print(json.dumps(json.loads(d[s:e+1])) if s>=0 and e>s else '{}')" \
-            2>/dev/null || echo "{}")
+          # Read the structured result from the dedicated file the script writes,
+          # NOT by scraping stdout. An earlier version used
+          # `awk '/^{/{p=1} p{print} /^}/{p=0}'` to find a JSON block in stdout,
+          # which silently truncates to whatever lies between the FIRST line
+          # starting with '{' and the FIRST line starting with '}' anywhere in
+          # the entire script output — including any earlier diagnostic print
+          # that happens to start with a brace. This produced a real observed
+          # bug: only 4 of 7 actually-registered functions were reported, because
+          # an earlier line in stdout closed the "capture" prematurely. Reading
+          # the file directly sidesteps this class of bug entirely.
+          if [[ -f "${DIAGNOSE_RESULT_FILE}" ]]; then
+            RESULT_JSON=$(cat "${DIAGNOSE_RESULT_FILE}")
+            if ! echo "${RESULT_JSON}" | jq empty 2>/dev/null; then
+              echo "::warning::${DIAGNOSE_RESULT_FILE} exists but is not valid JSON — falling back to empty result."
+              RESULT_JSON="{}"
+            fi
+          else
+            echo "::warning::${DIAGNOSE_RESULT_FILE} was not created by the script (it may have crashed before writing it). Falling back to empty result."
+            RESULT_JSON="{}"
+          fi
 
           IMPORT_OK=$(echo "${RESULT_JSON}"    | jq -r '.function_app_importable // false')
           ERROR_TYPE=$(echo "${RESULT_JSON}"   | jq -r '.error_type // ""')
           ERROR_MSG=$(echo "${RESULT_JSON}"    | jq -r '.error_message // ""' | head -c 300)
           FAILED_AT=$(echo "${RESULT_JSON}"    | jq -r '.failed_at_step // ""')
           FN_COUNT=$(echo "${RESULT_JSON}"     | jq -r '.registered_function_count // 0')
+          FN_NAMES=$(echo "${RESULT_JSON}"     | jq -r '.registered_function_names // [] | join(", ")')
+          FN_SOURCE=$(echo "${RESULT_JSON}"    | jq -r '.function_registry_source // "unknown"')
           DIAGNOSIS=$(echo "${RESULT_JSON}"    | jq -r '.diagnosis // ""' | head -c 400)
           FIX=$(echo "${RESULT_JSON}"          | jq -r '.fix // ""' | head -c 400)
           HAS_REG_FN=$(echo "${RESULT_JSON}"   | jq -r '.register_functions_exists_on_FunctionApp // true')
           HAS_REG_BP=$(echo "${RESULT_JSON}"   | jq -r '.register_blueprint_exists_on_FunctionApp // false')
 
+          echo ""
+          echo "Parsed from result file: ${FN_COUNT} function(s) via ${FN_SOURCE}: ${FN_NAMES}"
+
           echo "python_import_ok=${IMPORT_OK}"           >> /tmp/diag_state.env
           echo "python_error_type=${ERROR_TYPE}"         >> /tmp/diag_state.env
           echo "python_failed_at=${FAILED_AT}"           >> /tmp/diag_state.env
           echo "python_fn_count=${FN_COUNT}"             >> /tmp/diag_state.env
+          echo "python_fn_names=${FN_NAMES}"             >> /tmp/diag_state.env
+          echo "python_fn_source=${FN_SOURCE}"           >> /tmp/diag_state.env
           echo "python_diagnosis=${DIAGNOSIS}"           >> /tmp/diag_state.env
           echo "python_fix=${FIX}"                       >> /tmp/diag_state.env
           echo "python_register_fn_exists=${HAS_REG_FN}" >> /tmp/diag_state.env
@@ -1038,7 +1059,7 @@ jobs:
           echo "::endgroup::"
 
           if [[ "${IMPORT_OK}" == "true" && "${FN_COUNT}" -gt 0 ]]; then
-            echo "| D | D1 Python import test | ✅ PASS | Import succeeded — \`${FN_COUNT}\` function(s) registered in FunctionApp object |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| D | D1 Python import test | ✅ PASS | Import succeeded — \`${FN_COUNT}\` function(s) registered (via \`${FN_SOURCE}\`): ${FN_NAMES} |" >> "$GITHUB_STEP_SUMMARY"
           elif [[ "${IMPORT_OK}" == "true" && "${FN_COUNT}" -eq 0 ]]; then
             echo "python_import_zero_functions=true" >> /tmp/diag_state.env
             echo "| D | D1 Python import test | ⚠️ WARN | Import succeeded but \`0\` functions registered — blueprints may not be passed to register_functions() |" >> "$GITHUB_STEP_SUMMARY"
