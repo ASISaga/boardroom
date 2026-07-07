@@ -38,6 +38,16 @@ RESULT = {
 
 DIVIDER = "=" * 72
 
+# Structured results are written here as the SOLE SOURCE OF TRUTH for the
+# calling workflow. Earlier versions relied on scraping stdout for a JSON
+# block using brace-matching (awk '/^{/{p=1} p{print} /^}/{p=0}'), which
+# silently truncates if ANY earlier line in this script's output happens to
+# start with '{' or '}' (e.g. a dict repr in an error message, or output from
+# an intermediate diagnostic print). Writing to a dedicated file sidesteps
+# that entirely — the workflow should read this file directly rather than
+# parsing stdout.
+RESULT_FILE = os.environ.get("DIAGNOSE_RESULT_FILE", "/tmp/diagnose_import_result.json")
+
 
 def banner(title: str) -> None:
     print(f"\n{DIVIDER}")
@@ -45,11 +55,25 @@ def banner(title: str) -> None:
     print(DIVIDER)
 
 
+def write_result_file() -> None:
+    """Write the definitive, complete result to RESULT_FILE. Always call this
+    right before every sys.exit() so partial/failure states are captured too."""
+    try:
+        with open(RESULT_FILE, "w") as f:
+            json.dump(RESULT, f, indent=2)
+    except Exception as exc:
+        print(f"::warning::Could not write result file {RESULT_FILE}: {exc}")
+
+
 def print_result_json() -> None:
+    # Still print to stdout for human-readable log inspection, but this is no
+    # longer what the workflow parses — write_result_file() is authoritative.
     print(f"\n\n{DIVIDER}")
-    print("  STRUCTURED RESULTS (parsed by workflow)")
+    print("  STRUCTURED RESULTS (also written to file — see below)")
     print(DIVIDER)
     print(json.dumps(RESULT, indent=2))
+    write_result_file()
+    print(f"\n(Full untruncated result written to: {RESULT_FILE})")
 
 
 # ── Environment check ─────────────────────────────────────────────────────────
