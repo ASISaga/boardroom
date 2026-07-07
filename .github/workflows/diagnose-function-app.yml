@@ -704,40 +704,150 @@ jobs:
             echo "| B | B6 Container RBAC (workflow identity) | ✅ PASS | This workflow's identity has a role at container scope — Phase C should be able to download the package |" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: "B7 · Client certificate (mTLS) requirement — blocks ALL unauthenticated HTTP checks if Required"
+      - name: "B7 · Client certificate (mTLS) requirement — full investigation, not just clientCertEnabled/Mode"
         shell: bash
+        env:
+          APP_NAME: ${{ steps.resolve_app.outputs.app_name }}
+          RESOURCE_GROUP: ${{ steps.params.outputs.resource_group }}
         run: |
           set -euo pipefail
           FULL_JSON=$(cat /tmp/functionapp_full.json)
-          echo "::group::B7 — mTLS / client certificate requirement"
+          echo "::group::B7 — mTLS / client certificate — exhaustive field dump"
 
-          # WHY THIS CHECK EXISTS: an earlier run showed every unauthenticated HTTP
-          # check (admin ping, admin status, admin functions list, and the app's own
-          # HTTP route) returning "403 Forbidden: Client Certificate Required" — a
-          # platform-level TLS rejection that happens BEFORE the request reaches the
-          # Functions runtime at all. This is unrelated to whether functions are
-          # indexed; it blocks ALL traffic, authenticated or not, that doesn't present
-          # a client cert. Flagging it here means Phases E/G below can correctly
-          # attribute a 403 to this cause rather than to app-level auth or routing.
+          # WHY THIS CHECK EXISTS AND WHY IT WAS EXPANDED:
+          # A prior run found clientCertEnabled=null and clientCertMode=null via
+          # `az functionapp show --query`, yet the browser still received an active
+          # TLS client-certificate request (Chrome's "Choose certificate" dialog,
+          # ERR_SSL_CLIENT_AUTH_SIGNATURE_FAILED). NULL on these two properties does
+          # NOT mean "no mTLS" — it means these specific top-level properties are
+          # unset, but enforcement can come from several OTHER places:
+          #   1. siteConfig-nested cert properties (different JSON path entirely)
+          #   2. A Bicep/ARM template redeploy silently reverting the earlier portal
+          #      fix back to whatever the template hardcodes
+          #   3. A layer IN FRONT of the Function App — Front Door, Application
+          #      Gateway, API Management, or a Private Endpoint — enforcing mTLS
+          #      independently of the Function App resource's own settings entirely
+          # This check now dumps every plausible field/location so we stop guessing
+          # one property at a time.
 
-          CERT_ENABLED=$(echo "${FULL_JSON}" | jq -r '.clientCertEnabled // .properties.clientCertEnabled // "unknown"')
-          CERT_MODE=$(echo "${FULL_JSON}" | jq -r '.clientCertMode // .properties.clientCertMode // "unknown"')
+          echo "--- 1. Every leaf field anywhere in the JSON whose KEY contains 'cert' (case-insensitive) ---"
+          echo "${FULL_JSON}" | jq -r 'leaf_paths as $p | select(($p[-1]|tostring) | test("[Cc]ert")) | "\($p | join(".")) = \(getpath($p))"' 2>/dev/null || echo "  (jq query failed — see raw JSON dump in B1 above as fallback)"
 
-          echo "clientCertEnabled: ${CERT_ENABLED}"
-          echo "clientCertMode:    ${CERT_MODE}"
-          echo "::endgroup::"
+          echo ""
+          echo "--- 2. siteConfig block specifically (properties can live here instead of top-level) ---"
+          echo "${FULL_JSON}" | jq '.siteConfig // .properties.siteConfig // "siteConfig not found at either path"' 2>/dev/null | grep -i -A2 -B2 "cert" || echo "  (no 'cert' match inside siteConfig)"
 
+          echo ""
+          echo "--- 3. Top-level clientCert* properties, tried at every plausible nesting ---"
+          for path in \
+            '.clientCertEnabled' '.properties.clientCertEnabled' '.siteConfig.clientCertEnabled' \
+            '.clientCertMode' '.properties.clientCertMode' '.siteConfig.clientCertMode' \
+            '.clientCertExclusionPaths' '.properties.clientCertExclusionPaths'; do
+            val=$(echo "${FULL_JSON}" | jq -r "${path} // \"MISSING\"" 2>/dev/null)
+            echo "  ${path} = ${val}"
+          done
+
+          CERT_ENABLED=$(echo "${FULL_JSON}" | jq -r '.clientCertEnabled // .properties.clientCertEnabled // .siteConfig.clientCertEnabled // "null"')
+          CERT_MODE=$(echo "${FULL_JSON}" | jq -r '.clientCertMode // .properties.clientCertMode // .siteConfig.clientCertMode // "null"')
           echo "client_cert_enabled=${CERT_ENABLED}" >> /tmp/diag_state.env
           echo "client_cert_mode=${CERT_MODE}"       >> /tmp/diag_state.env
 
+          echo ""
+          echo "--- 4. hostNameSslStates (a different mTLS-adjacent config surface) ---"
+          echo "${FULL_JSON}" | jq '.hostNameSslStates // .properties.hostNameSslStates // "not found"' 2>/dev/null
+
+          echo ""
+          echo "--- 5. Recent ARM deployments to this resource group — checking for a Bicep revert AFTER any portal fix ---"
+          RECENT_DEPLOYS=$(az deployment group list \
+            --resource-group "${RESOURCE_GROUP}" \
+            --query "sort_by([], &properties.timestamp)[-5:].{name:name, timestamp:properties.timestamp, state:properties.provisioningState}" \
+            -o json 2>/tmp/deploy_list_err.txt) || {
+              echo "  Could not list deployments:"
+              cat /tmp/deploy_list_err.txt
+              RECENT_DEPLOYS="[]"
+            }
+          echo "${RECENT_DEPLOYS}" | jq -r '.[] | "  \(.timestamp)  \(.state)  \(.name)"' 2>/dev/null || echo "  (none found or query failed)"
+          LATEST_DEPLOY_TIME=$(echo "${RECENT_DEPLOYS}" | jq -r '.[-1].timestamp // "none"' 2>/dev/null)
+          echo "latest_deployment_timestamp=${LATEST_DEPLOY_TIME}" >> /tmp/diag_state.env
+
+          echo ""
+          echo "--- 6. Is there a Front Door, App Gateway, APIM, or Private Endpoint in front of this app? ---"
+          echo "  (These can enforce mTLS independently of the Function App's own clientCert* settings.)"
+          FRONTDOOR_CHECK=$(az afd profile list --query "[].name" -o tsv 2>/dev/null || true)
+          APPGW_CHECK=$(az network application-gateway list --resource-group "${RESOURCE_GROUP}" --query "[].name" -o tsv 2>/dev/null || true)
+          PE_CHECK=$(az network private-endpoint list --resource-group "${RESOURCE_GROUP}" --query "[].name" -o tsv 2>/dev/null || true)
+          echo "  Front Door profiles found (any RG): ${FRONTDOOR_CHECK:-none}"
+          echo "  Application Gateways in ${RESOURCE_GROUP}: ${APPGW_CHECK:-none}"
+          echo "  Private Endpoints in ${RESOURCE_GROUP}: ${PE_CHECK:-none}"
+          [[ -n "${FRONTDOOR_CHECK}" || -n "${APPGW_CHECK}" || -n "${PE_CHECK}" ]] && \
+            echo "front_layer_detected=true" >> /tmp/diag_state.env
+
+          echo "::endgroup::"
+
+          # ── Evaluation ──────────────────────────────────────────────────
           if [[ "${CERT_ENABLED}" == "true" && "${CERT_MODE}" == "Required" ]]; then
             echo "client_cert_blocking=true" >> /tmp/diag_state.env
-            echo "::warning::clientCertMode=Required. Every unauthenticated HTTPS request — including this workflow's own smoke tests below AND real user/API traffic — will receive 403 'Client Certificate Required' before reaching your code. If this is unintentional, real production traffic is currently being rejected."
-            echo "| B | B7 Client certificate requirement | ❌ FAIL | clientCertEnabled=\`true\`, clientCertMode=\`Required\` — ALL unauthenticated HTTP traffic (including E1/E2/G1 checks below, and real users) gets 403 before reaching your code |" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::clientCertMode=Required at the Function App resource level. Every unauthenticated HTTPS request will be TLS-rejected before reaching your code."
+            echo "| B | B7 Client certificate | ❌ FAIL | clientCertEnabled=\`true\`, clientCertMode=\`Required\` at the app resource level |" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "${CERT_ENABLED}" == "null" && "${CERT_MODE}" == "null" ]]; then
+            echo "client_cert_fields_null=true" >> /tmp/diag_state.env
+            echo "::warning::clientCertEnabled AND clientCertMode are both null on the Function App resource itself, yet a live browser test may still show a TLS client-cert prompt. If so, the enforcement is NOT coming from this resource's own settings — check hostNameSslStates, any Front Door/App Gateway/Private Endpoint found above, or re-verify with 'curl -v' which bypasses browser-side cert auto-negotiation entirely."
+            echo "| B | B7 Client certificate | ⚠️ WARN | Both fields are \`null\` on this resource. If a TLS cert prompt still appears in-browser, the cause is external to this Function App's own settings — see B7 log sections 2, 4, 5, 6 above for where else to look |" >> "$GITHUB_STEP_SUMMARY"
           elif [[ "${CERT_ENABLED}" == "true" && "${CERT_MODE}" == "Optional" ]]; then
-            echo "| B | B7 Client certificate requirement | ⚠️ WARN | clientCertEnabled=\`true\`, clientCertMode=\`Optional\` — requests without a cert are allowed through, but confirm this is intended |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| B | B7 Client certificate | ⚠️ WARN | clientCertEnabled=\`true\`, clientCertMode=\`Optional\` — should allow requests without a cert |" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "| B | B7 Client certificate requirement | ✅ PASS | clientCertEnabled=\`${CERT_ENABLED}\` — no mTLS blocking expected |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| B | B7 Client certificate | ✅ PASS | clientCertEnabled=\`${CERT_ENABLED}\`, clientCertMode=\`${CERT_MODE}\` |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [[ -n "${RECENT_DEPLOYS}" && "${RECENT_DEPLOYS}" != "[]" ]]; then
+            echo "| B | B7 Recent deployments | ℹ️ INFO | Latest ARM deployment to \`${RESOURCE_GROUP}\`: \`${LATEST_DEPLOY_TIME}\` — compare this against when any portal-based clientCertMode fix was made; a later Bicep deploy would silently revert it |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [[ "${front_layer_detected:-}" == "true" ]]; then
+            echo "| B | B7 Front-facing layer | ⚠️ WARN | Front Door/App Gateway/Private Endpoint detected — one of these may enforce mTLS independently of the Function App's own settings |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: "B8 · Direct TLS handshake test — does the server actually request a client cert?"
+        shell: bash
+        env:
+          APP_NAME: ${{ steps.resolve_app.outputs.app_name }}
+        run: |
+          set -euo pipefail
+          source /tmp/diag_state.env 2>/dev/null || true
+          echo "::group::B8 — Raw TLS handshake inspection (bypasses browser cert auto-negotiation entirely)"
+
+          # WHY THIS CHECK EXISTS: clientCertEnabled/clientCertMode can both be null
+          # (per B7) while the LIVE TLS ENDPOINT still actively requests a client
+          # certificate during the handshake — this was observed directly via a
+          # browser's native cert-picker dialog and ERR_SSL_CLIENT_AUTH_SIGNATURE_FAILED.
+          # A JSON property being null does not prove the live endpoint's behavior;
+          # only a real TLS handshake does. openssl s_client shows the exact
+          # "Acceptable client certificate CA names" / CertificateRequest message
+          # the server sends, which is the ground truth regardless of what any
+          # config property claims.
+
+          HOSTNAME="${app_hostname:-${APP_NAME}.azurewebsites.net}"
+          echo "Testing TLS handshake against: ${HOSTNAME}:443"
+          echo ""
+
+          # -status and -msg show handshake message types; a CertificateRequest
+          # message from the server is unambiguous proof of mTLS being requested.
+          HANDSHAKE_OUTPUT=$(echo | timeout 15 openssl s_client -connect "${HOSTNAME}:443" -servername "${HOSTNAME}" -msg 2>&1 || true)
+
+          echo "${HANDSHAKE_OUTPUT}" | grep -A5 -i "CertificateRequest\|certificate_request" || echo "  (no CertificateRequest message found in handshake — see full output below if this seems wrong)"
+          echo ""
+          echo "--- Full handshake summary (verify/cert chain lines) ---"
+          echo "${HANDSHAKE_OUTPUT}" | grep -iE "verify|Certificate chain|subject=|issuer=" | head -20
+
+          echo "::endgroup::"
+
+          if echo "${HANDSHAKE_OUTPUT}" | grep -qi "CertificateRequest"; then
+            echo "tls_requests_client_cert=true" >> /tmp/diag_state.env
+            echo "::error::The live TLS endpoint DOES send a CertificateRequest during handshake — this is happening regardless of what clientCertEnabled/clientCertMode show in B7 (which were null). This is very likely coming from a layer other than the Function App resource's own top-level settings — see B7's Front Door/App Gateway/Private Endpoint check, or hostNameSslStates, or check whether Easy Auth / an API Management front-end is involved."
+            echo "| B | B8 TLS handshake | ❌ FAIL | Server DOES send CertificateRequest during TLS handshake — mTLS is being enforced at the TLS layer regardless of what B7's JSON fields show |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "tls_requests_client_cert=false" >> /tmp/diag_state.env
+            echo "| B | B8 TLS handshake | ✅ PASS | No CertificateRequest observed — server does not appear to require a client cert at the TLS layer right now |" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       # ══════════════════════════════════════════════════════════════════════
@@ -1492,8 +1602,23 @@ jobs:
           fi
 
           if [[ "${client_cert_blocking:-}" == "true" ]]; then
-            CAUSES+=("🔴 P0  clientCertMode=Required — ALL unauthenticated HTTP traffic (real users, health checks, and this workflow's own smoke tests) is rejected with 403 before reaching your code. This affects production traffic independent of whether functions are indexed.")
+            CAUSES+=("🔴 P0  clientCertMode=Required at the Function App resource level — ALL unauthenticated HTTP traffic (real users, health checks, and this workflow's own smoke tests) is rejected with 403 before reaching your code.")
             FIXES+=("az functionapp update --name '${app_name_resolved:-APP_NAME}' --resource-group '${DEFAULT_RESOURCE_GROUP}' --set clientCertMode=Optional   (or clientCertEnabled=false if client certs are not needed at all)")
+          fi
+
+          if [[ "${tls_requests_client_cert:-}" == "true" ]]; then
+            CAUSES+=("🔴 P0  CONFIRMED VIA LIVE TLS HANDSHAKE (B8): the server sends a CertificateRequest during TLS negotiation right now. This is ground truth from the actual endpoint, independent of what any JSON property reports.")
+            if [[ "${client_cert_fields_null:-}" == "true" ]]; then
+              CAUSES[-1]+=" Since B7 found clientCertEnabled/clientCertMode both null on the Function App resource itself, this enforcement is coming from somewhere ELSE — check B7's Front Door/App Gateway/Private Endpoint detection, hostNameSslStates output, and whether a recent ARM/Bicep deployment (see B7 timestamp) reconfigured something outside the two properties this workflow checks by name."
+              FIXES+=("Investigate: (1) run 'az afd profile list', 'az network application-gateway list', 'az network private-endpoint list' against every resource group in the subscription, not just this app's RG — the enforcing resource may live elsewhere; (2) check API Management if used as a front door; (3) check Easy Auth / App Service Authentication settings; (4) re-run this workflow immediately after any fix to confirm B8 changes from FAIL to PASS, since B8 is ground truth and JSON properties alone are not sufficient evidence of a fix.")
+            else
+              FIXES+=("az functionapp update --name '${app_name_resolved:-APP_NAME}' --resource-group '${DEFAULT_RESOURCE_GROUP}' --set clientCertMode=Optional, then restart: az functionapp restart --name '${app_name_resolved:-APP_NAME}' --resource-group '${DEFAULT_RESOURCE_GROUP}'. Re-run this workflow afterward — B8 (not B7) is the check that will confirm whether the fix actually took effect at the TLS layer.")
+            fi
+          fi
+
+          if [[ "${front_layer_detected:-}" == "true" && "${tls_requests_client_cert:-}" == "true" ]]; then
+            CAUSES+=("🟠 P1  A Front Door, Application Gateway, or Private Endpoint was detected in the resource group, AND the TLS handshake confirms mTLS is active. These front-facing resources commonly enforce their own independent mTLS policy that the Function App's clientCertMode setting cannot override or even see.")
+            FIXES+=("Check the mTLS/client-certificate settings on the specific Front Door profile, Application Gateway, or Private Endpoint listed in the B7 log — the fix likely needs to be applied there, not on the Function App resource.")
           fi
 
           # ── P0.5: Identity/RBAC ambiguity — must be resolved before trusting any RBAC PASS above ──
