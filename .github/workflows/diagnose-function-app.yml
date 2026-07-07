@@ -786,7 +786,8 @@ jobs:
             }
 
           BLOB_COUNT=$(echo "${BLOBS}" | jq 'length')
-          echo "Blobs in container: ${BLOB_COUNT}"
+          echo "Blobs in container (all types): ${BLOB_COUNT}"
+          echo "${BLOBS}" | jq -r '.[] | "  \(.properties.lastModified)  \(.properties.contentLength) bytes  \(.name)"'
 
           if [[ "${BLOB_COUNT}" -eq 0 ]]; then
             echo "package_skipped=no_blobs" >> /tmp/diag_state.env
@@ -795,10 +796,29 @@ jobs:
             exit 0
           fi
 
-          LATEST_NAME=$(echo "${BLOBS}" | jq -r '.[-1].name')
-          LATEST_MOD=$(echo "${BLOBS}" | jq -r '.[-1].properties.lastModified')
-          LATEST_BYTES=$(echo "${BLOBS}" | jq -r '.[-1].properties.contentLength')
-          echo "Latest blob: ${LATEST_NAME}  (${LATEST_MOD}, ${LATEST_BYTES} bytes)"
+          # NOTE: Flex Consumption's deployment container also holds platform-internal
+          # bookkeeping files (e.g. kudu-state.json) alongside the actual deployment
+          # package. These can be MORE RECENTLY modified than the package zip itself
+          # (the platform touches kudu-state.json on every deploy/restart), so a plain
+          # "most recently modified blob" selection can pick the wrong file entirely.
+          # Filter to .zip files specifically before selecting the latest.
+          ZIP_BLOBS=$(echo "${BLOBS}" | jq '[.[] | select(.name | endswith(".zip"))]')
+          ZIP_COUNT=$(echo "${ZIP_BLOBS}" | jq 'length')
+          echo ""
+          echo "Blobs matching *.zip: ${ZIP_COUNT}"
+
+          if [[ "${ZIP_COUNT}" -eq 0 ]]; then
+            echo "::error::No .zip blobs found in the deployment container — only non-package files (e.g. kudu-state.json) are present. Nothing has been successfully deployed as a package, or the deploy workflow uses a different file extension/naming convention than expected."
+            echo "package_skipped=no_zip_blobs" >> /tmp/diag_state.env
+            echo "| C | C1 Download package | ❌ FAIL | No \`.zip\` blob found in container — only non-package files present (see log for full listing) |" >> "$GITHUB_STEP_SUMMARY"
+            echo "::endgroup::"
+            exit 0
+          fi
+
+          LATEST_NAME=$(echo "${ZIP_BLOBS}" | jq -r '.[-1].name')
+          LATEST_MOD=$(echo "${ZIP_BLOBS}" | jq -r '.[-1].properties.lastModified')
+          LATEST_BYTES=$(echo "${ZIP_BLOBS}" | jq -r '.[-1].properties.contentLength')
+          echo "Latest .zip blob: ${LATEST_NAME}  (${LATEST_MOD}, ${LATEST_BYTES} bytes)"
           echo "package_blob_name=${LATEST_NAME}"     >> /tmp/diag_state.env
           echo "package_blob_modified=${LATEST_MOD}"  >> /tmp/diag_state.env
 
