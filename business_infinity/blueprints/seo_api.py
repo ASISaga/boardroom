@@ -11,7 +11,7 @@ seo_blueprint = func.Blueprint()
 
 
 @seo_blueprint.route(route="seo/summary", methods=["GET"])
-def seo_summary(_req: func.HttpRequest) -> func.HttpResponse:
+def seo_summary(req: func.HttpRequest) -> func.HttpResponse:
     """Return SEO taxonomy summary metrics."""
     return json_response(
         {
