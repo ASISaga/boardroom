@@ -1306,7 +1306,7 @@ jobs:
             echo "| E | E3 Deployment history | ⚠️ WARN | Latest status=\`${LATEST_STATUS}\` at \`${LATEST_TIME}\` |" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: "E4 · Restart + syncfunctiontriggers + function count recheck"
+      - name: "E4 · Restart + syncfunctiontriggers + compare ARM count vs LIVE HOST count"
         if: inputs.skip_restart != true
         shell: bash
         env:
@@ -1314,22 +1314,35 @@ jobs:
           RESOURCE_GROUP: ${{ steps.params.outputs.resource_group }}
         run: |
           set -euo pipefail
-          echo "::group::E4 — Restart + syncfunctiontriggers (via ARM REST)"
-          # az functionapp sync-triggers does not exist — use the ARM REST action directly
+          echo "::group::E4 — Restart + syncfunctiontriggers + ARM-vs-live-host comparison"
+
+          # WHY THIS CHECK WAS REWRITTEN:
+          # A real investigation found ARM's `az functionapp function list` reporting
+          # 7 functions (stable, before AND after a restart+sync cycle) while the
+          # LIVE HOST's own /admin/functions endpoint returned [] — zero — at the
+          # exact same time, and every real HTTP route 404'd accordingly. ARM's count
+          # can reflect a cached/last-known-good sync result that does NOT prove the
+          # currently-running host process has actually loaded those routes for HTTP
+          # dispatch. This check now queries BOTH sources and treats the LIVE HOST
+          # admin API as authoritative for "will real HTTP requests actually work" —
+          # ARM is kept only as a secondary/comparison data point.
 
           SUB=$(az account show --query id -o tsv)
           SYNC_URL="https://management.azure.com/subscriptions/${SUB}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Web/sites/${APP_NAME}/syncfunctiontriggers?api-version=2023-12-01"
+          HOSTNAME=$(az resource show --resource-group "${RESOURCE_GROUP}" --name "${APP_NAME}" \
+            --resource-type "Microsoft.Web/sites" \
+            --query "properties.defaultHostName" -o tsv 2>/dev/null || echo "${APP_NAME}.azurewebsites.net")
+          echo "Using hostname: ${HOSTNAME}"
 
-          BEFORE=$(az functionapp function list \
+          ARM_BEFORE=$(az functionapp function list \
             --name "${APP_NAME}" --resource-group "${RESOURCE_GROUP}" \
             --query "length([])" -o tsv 2>/dev/null || echo "0")
-          echo "Function count BEFORE: ${BEFORE}"
+          echo "ARM function count BEFORE restart: ${ARM_BEFORE}"
 
           echo "Restarting ${APP_NAME}..."
           T0=$(date +%s)
           az functionapp restart --name "${APP_NAME}" --resource-group "${RESOURCE_GROUP}"
-          echo "Restart returned in $(( $(date +%s) - T0 ))s — waiting 35s for cold start..."
-          sleep 35
+          echo "Restart command returned in $(( $(date +%s) - T0 ))s"
 
           echo "Calling ARM syncfunctiontriggers..."
           T1=$(date +%s)
@@ -1338,25 +1351,78 @@ jobs:
           echo "syncfunctiontriggers returned in ${SYNC_DUR}s"
           echo "sync_duration=${SYNC_DUR}" >> /tmp/diag_state.env
 
-          echo "Waiting 15s for indexing to settle..."
-          sleep 15
+          # Retrieve master key once, up front, for the live-host admin API calls below.
+          MASTER_KEY=$(az functionapp keys list \
+            --name "${APP_NAME}" --resource-group "${RESOURCE_GROUP}" \
+            --query "masterKey" -o tsv 2>/dev/null || true)
 
-          AFTER=$(az functionapp function list \
+          if [[ -z "${MASTER_KEY}" ]]; then
+            echo "::warning::Could not retrieve master key — cannot query the live host's /admin/functions. Falling back to ARM-only comparison (less reliable, per the note above)."
+          fi
+
+          # ── Poll the LIVE HOST directly, with retries, since cold start after a
+          # restart can take anywhere from a few seconds to over a minute. Retrying
+          # with backoff avoids both false negatives (checked too early) and
+          # excessive fixed sleep (checked later than necessary).
+          LIVE_COUNT=-1
+          LIVE_BODY=""
+          MAX_ATTEMPTS=8
+          for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
+            SLEEP_FOR=$(( attempt * 8 ))
+            echo "Attempt ${attempt}/${MAX_ATTEMPTS}: waiting ${SLEEP_FOR}s before checking live host..."
+            sleep "${SLEEP_FOR}"
+
+            if [[ -n "${MASTER_KEY}" ]]; then
+              HTTP_CODE=$(curl -s -o /tmp/e4_admin_functions.json -w "%{http_code}" --max-time 20 \
+                "https://${HOSTNAME}/admin/functions" \
+                -H "x-functions-key: ${MASTER_KEY}" 2>/dev/null || echo "000")
+              LIVE_BODY=$(cat /tmp/e4_admin_functions.json 2>/dev/null || echo "")
+              echo "  HTTP ${HTTP_CODE}, body: $(echo "${LIVE_BODY}" | head -c 300)"
+
+              if [[ "${HTTP_CODE}" == "200" ]]; then
+                LIVE_COUNT=$(echo "${LIVE_BODY}" | jq 'length' 2>/dev/null || echo "-1")
+                if [[ "${LIVE_COUNT}" -gt 0 ]]; then
+                  echo "  Live host reports ${LIVE_COUNT} function(s) — stopping retry loop."
+                  break
+                fi
+              fi
+            else
+              break
+            fi
+          done
+
+          ARM_AFTER=$(az functionapp function list \
             --name "${APP_NAME}" --resource-group "${RESOURCE_GROUP}" \
             --query "length([])" -o tsv 2>/dev/null || echo "0")
-          echo "Function count AFTER: ${AFTER}"
-          echo "arm_function_count_after=${AFTER}" >> /tmp/diag_state.env
+
+          echo ""
+          echo "=== FINAL COMPARISON ==="
+          echo "ARM function count (before restart):  ${ARM_BEFORE}"
+          echo "ARM function count (after sync):      ${ARM_AFTER}"
+          echo "LIVE HOST function count (/admin/functions, after up to $(( MAX_ATTEMPTS * (MAX_ATTEMPTS + 1) / 2 * 8 ))s of retries): ${LIVE_COUNT}"
+
+          echo "arm_function_count_after=${ARM_AFTER}" >> /tmp/diag_state.env
+          echo "live_host_function_count=${LIVE_COUNT}" >> /tmp/diag_state.env
           echo "::endgroup::"
 
           [[ "${SYNC_DUR}" -gt 20 ]] && \
-            echo "::warning::syncfunctiontriggers took ${SYNC_DUR}s. Healthy syncs complete in <5s. Stall suggests storage read timeout or host/network issue."
+            echo "::warning::syncfunctiontriggers took ${SYNC_DUR}s. Healthy syncs complete in <5s."
 
-          if [[ "${AFTER}" -gt 0 ]]; then
+          # ── Evaluation — LIVE HOST count is authoritative; ARM is secondary ──
+          if [[ "${LIVE_COUNT}" -gt 0 ]]; then
             echo "sync_resolved=true" >> /tmp/diag_state.env
-            echo "| E | E4 Restart + sync | ✅ PASS | sync ${SYNC_DUR}s — \`${AFTER}\` function(s) registered (was ${BEFORE}) |" >> "$GITHUB_STEP_SUMMARY"
-          else
+            echo "| E | E4 Restart + sync | ✅ PASS | LIVE HOST reports \`${LIVE_COUNT}\` function(s) via /admin/functions (ARM: ${ARM_BEFORE} → ${ARM_AFTER}) — real HTTP routes should work |" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "${LIVE_COUNT}" -eq 0 ]]; then
             echo "sync_still_zero=true" >> /tmp/diag_state.env
-            echo "| E | E4 Restart + sync | ❌ FAIL | sync ${SYNC_DUR}s — still \`0\` functions. Problem is deterministic, not a caching artifact. |" >> "$GITHUB_STEP_SUMMARY"
+            echo "live_host_arm_divergence=true" >> /tmp/diag_state.env
+            if [[ "${ARM_AFTER}" -gt 0 ]]; then
+              echo "::error::CRITICAL DIVERGENCE: ARM reports ${ARM_AFTER} function(s), but the LIVE HOST's own /admin/functions reports 0, even after ${MAX_ATTEMPTS} retries with backoff following a fresh restart+sync. This means ARM's count is stale/cached and does NOT reflect what the currently-running host process actually has loaded for HTTP dispatch. Real HTTP requests to any route will 404 despite ARM showing functions present."
+              echo "| E | E4 Restart + sync | ❌ FAIL | **DIVERGENCE**: ARM shows \`${ARM_AFTER}\` function(s), but LIVE HOST /admin/functions shows \`0\` after retries — ARM count is unreliable here; trust the live host, not ARM. Real HTTP traffic will 404. |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "| E | E4 Restart + sync | ❌ FAIL | Both ARM (\`${ARM_AFTER}\`) and LIVE HOST (\`0\`) agree: no functions currently loaded after restart+sync. |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            echo "| E | E4 Restart + sync | ⚠️ WARN | Could not determine live host function count (master key unavailable or all requests failed) — ARM shows ${ARM_BEFORE} → ${ARM_AFTER}, but this is unverified against the live host |" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: "E4 skipped"
