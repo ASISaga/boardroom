@@ -31,7 +31,7 @@ def _get_credential():
 
 
 @boardroom_blueprint.route(route="boardroom/workflows", methods=["GET"])
-def boardroom_workflows(_req: func.HttpRequest) -> func.HttpResponse:
+def boardroom_workflows(req: func.HttpRequest) -> func.HttpResponse:
     """Return all registered boardroom workflows."""
     workflows = WorkflowRegistryManager.list_all()
     return json_response(
