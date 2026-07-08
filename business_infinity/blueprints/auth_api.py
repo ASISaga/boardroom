@@ -1,5 +1,5 @@
 """Auth API blueprint — issues a session token for the shared team password.
-
+ 
 The same token is used for both:
 - our own backend routes (verified via require_auth / JWT_SECRET), and
 - the CopilotKit runtime client, which is expected to send it as a
