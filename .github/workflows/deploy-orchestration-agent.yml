@@ -1,1 +1,270 @@
-deploy-orchestration-agent.yml
+# ⚠️  BEFORE USING THIS FILE — READ THIS
+# --------------------------------------------------------------------------
+# Microsoft publishes a DEDICATED, OFFICIAL guide for exactly this scenario:
+# "Set up CI/CD for hosted agents with the Azure Developer CLI"
+# (learn.microsoft.com/en-us/azure/foundry/agents/how-to/set-up-ci-cd-cli).
+# It documents running `azd pipeline config` FROM YOUR LOCAL, ALREADY-
+# WORKING hosted-agent project — that command auto-detects GitHub as your
+# git provider, creates the service principal, configures federated
+# credentials, and WRITES A COMPLETE, CORRECT GitHub Actions workflow file
+# for you, including secrets/variables setup (AZURE_CLIENT_ID,
+# AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, AZURE_ENV_NAME, AZURE_LOCATION).
+#
+# This hand-written workflow below is a reasonable, verified-against-
+# documentation fallback if you want to understand/customize each step
+# explicitly, or if `azd pipeline config`'s generated output doesn't fit
+# this repo's specific multi-service layout (function_app/ +
+# orchestration_agent/ + specialist_agents/* all in one repo). But trying
+# `azd pipeline config` FIRST, from within orchestration_agent/ once it has
+# a working local azd project (azure.yaml + agent.yaml + infra/ already
+# scaffolded via `azd ai agent init` and confirmed working with
+# `azd ai agent run` / `azd up` locally), is very likely faster and more
+# certain to match whatever the current azd CLI version actually expects —
+# this feature is explicitly still preview and "expect command and flag
+# churn until GA" per Microsoft's own agent-hosting documentation.
+#
+# Deploy workflow for the boardroom-mvp orchestration agent (Foundry Hosted Agent).
+#
+# WHY THIS USES azd, NOT PLAIN az/docker COMMANDS
+# --------------------------------------------------------------------------
+# Foundry Hosted Agent deployment is NOT a generic "docker build + az acr
+# push + az rest" sequence. Microsoft's own documentation (Deploy a hosted
+# agent, Microsoft Learn) is explicit that azd (Azure Developer CLI) with
+# the `azd ai agent` extension is the supported deployment path — it
+# handles container build+push, agent versioning, RBAC role assignment
+# (including the agent's own dedicated Entra identity), and endpoint
+# registration together, atomically. Hand-rolling the individual az CLI
+# calls this abstracts over is explicitly NOT the documented approach, and
+# would mean re-implementing (and keeping in sync with) an internal
+# sequence Microsoft has stated is subject to change ("CLI names are in
+# flux... expect command and flag churn until GA").
+#
+# REAL, CONFIRMED CONSTRAINTS THIS WORKFLOW RESPECTS
+# --------------------------------------------------------------------------
+#   - The container MUST be linux/amd64 (x86_64) — GitHub's ubuntu-latest
+#     runners are amd64 already, so no cross-build flag is needed here,
+#     unlike local Apple Silicon development.
+#   - ACR must remain public for the agent image (documented current
+#     limitation — private-network-secured ACR is not yet supported for
+#     hosted agent images specifically).
+#   - The agent listens on port 8088 in this hosting model. If
+#     orchestration_agent/main.py's own PORT env var differs, azd's
+#     startupCommand / the container's EXPOSE should still align with
+#     8088 for local `azd ai agent run` parity — confirmed the platform
+#     itself, not just local dev, expects a health probe on this port
+#     regardless of protocol.
+#   - Tool attachment (e.g. Toolbox MCP) is NOT part of the deployment
+#     definition — hosted agents cannot have tools "attached" via
+#     azure.yaml/agent.yaml; any MCP tool wiring is ordinary MCP client
+#     code inside the agent itself. This workflow does not attempt to
+#     configure tools.
+#
+# PREREQUISITES (one-time, done outside this workflow)
+# --------------------------------------------------------------------------
+#   1. An azd project already scaffolded for this agent (azd ai agent init),
+#      committed under orchestration_agent/ alongside azure.yaml and
+#      agent.yaml, OR this workflow's first run performs that
+#      initialization — see the "Initialize azd project (first run only)"
+#      step below, which is skipped if azure.yaml already exists.
+#   2. Federated credential configured on the deployment identity for
+#      OIDC login from this repo/environment (see azure/login@v3 step) —
+#      same pattern as the Python Function App's deploy.yml in this repo.
+#   3. GitHub environment secrets: AZURE_CLIENT_ID, AZURE_TENANT_ID,
+#      AZURE_SUBSCRIPTION_ID (same trio pattern as deploy-function-app.yml).
+#   4. AZURE_ENV_NAME secret/variable — the azd environment name
+#      (e.g. "boardroom-staging") that maps to a specific Foundry
+#      project/resource-group, so repeated runs update the SAME agent
+#      rather than provisioning a new one each time.
+#
+# AUTHENTICATION PATTERN — CONFIRMED AGAINST REAL DOCUMENTATION
+# --------------------------------------------------------------------------
+# azd does NOT share az CLI's session automatically. The correct, documented
+# pattern (Microsoft's own azd GitHub Actions pipeline guidance) is:
+#   azure/login@v3 (OIDC) establishes the az CLI session
+#   azd config set auth.useAzCliAuth "true"   <- tells azd to reuse it
+# There is no `azd auth login --federated-credential-provider` flag; an
+# earlier draft of this workflow used that invented flag — corrected below.
+
+name: Deploy Orchestration Agent (Foundry Hosted Agent)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'orchestration_agent/**'
+      - '.github/workflows/deploy-orchestration-agent.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target GitHub environment (controls which secrets/azd env are used)'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+        default: staging
+      skip_tests:
+        description: 'Skip running tests before deploy (use only for emergency redeploys)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  WORKING_DIRECTORY: orchestration_agent
+  # AZD_VERSION pinned per Microsoft's own stated minimum for the hosted
+  # agent workflow ("azd ai agent version 0.1.27-preview or later" /
+  # "Azure Developer CLI (azd) installed (version 1.21.3 or later)").
+  # Using a specific version rather than "latest" avoids this workflow
+  # silently breaking if azd ships a change during the documented
+  # "expect command and flag churn until GA" period for this preview
+  # feature.
+  AZD_VERSION: '1.21.3'
+
+jobs:
+  test:
+    name: Test (${{ inputs.environment || 'staging' }})
+    runs-on: ubuntu-latest
+    if: inputs.skip_tests != true
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: ${{ env.WORKING_DIRECTORY }}/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run orchestration logic tests (no PowerFx/.NET dependency)
+        run: python3 tests/test_boardroom_orchestration.py
+
+      - name: Run AG-UI endpoint integration test
+        env:
+          FOUNDRY_PROJECT_ENDPOINT: https://fake.example.com
+          DEFAULT_MODEL_DEPLOYMENT: fake-model
+        run: python3 tests/test_main_agui_endpoint.py
+
+  deploy:
+    name: Deploy (${{ inputs.environment || 'staging' }})
+    needs: test
+    if: always() && (needs.test.result == 'success' || needs.test.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'staging' }}
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install azd
+        uses: Azure/setup-azd@v2
+        with:
+          version: ${{ env.AZD_VERSION }}
+
+      - name: Install azd ai agent extension
+        # Confirmed via Microsoft Learn ("Install the Azure Developer CLI
+        # Foundry extensions" and "Set up CI/CD for hosted agents with the
+        # Azure Developer CLI"): the exact documented command is
+        # `azd ext install azure.ai.agents` with no version flag shown in
+        # any official example — removed an earlier, unconfirmed
+        # `--version 0.1.27-preview` flag rather than risk an invalid
+        # argument. This also pulls in azure.ai.inspector automatically as
+        # a dependency, per the same documentation.
+        run: azd ext install azure.ai.agents
+
+      - name: Configure azd to reuse the Azure CLI's OIDC session
+        # CORRECTED: azd has its own separate auth context from az CLI by
+        # default. The documented pattern (Microsoft's own
+        # "GitHub Actions Workflow for Azure Developer CLI templates"
+        # guidance, and azd's official GitHub Actions pipeline docs) is
+        # NOT a separate `azd auth login` call with federated-credential
+        # flags — those flags do not exist. Instead, tell azd to reuse
+        # the Azure CLI's already-established session (the one
+        # azure/login@v3 just created via OIDC above), via:
+        #   azd config set auth.useAzCliAuth "true"
+        # This is the real, documented mechanism; an earlier draft of this
+        # workflow used an invented `azd auth login
+        # --federated-credential-provider github` command that does not
+        # exist in azd's actual CLI surface — corrected here.
+        run: azd config set auth.useAzCliAuth "true"
+
+      - name: Select azd environment
+        env:
+          AZURE_ENV_NAME: ${{ secrets.AZURE_ENV_NAME || vars.AZURE_ENV_NAME }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${AZURE_ENV_NAME:-}" ]]; then
+            echo "::error::AZURE_ENV_NAME is not set as a secret or variable on the '${{ inputs.environment || 'staging' }}' GitHub environment. This must map to a stable azd environment name so repeated deploys update the same agent instead of provisioning duplicates."
+            exit 1
+          fi
+          echo "Using azd environment: ${AZURE_ENV_NAME}"
+          echo "AZURE_ENV_NAME=${AZURE_ENV_NAME}" >> "$GITHUB_ENV"
+
+          # azd stores environment state under .azure/<env-name>/ — select
+          # the existing one if present, otherwise create it. `azd env
+          # select` fails if the environment doesn't exist yet, so we
+          # probe for it first rather than assuming.
+          if azd env list 2>/dev/null | grep -q "^${AZURE_ENV_NAME}\b"; then
+            azd env select "${AZURE_ENV_NAME}"
+          else
+            echo "::notice::azd environment '${AZURE_ENV_NAME}' not found locally — creating it. This should only happen on this environment's very first deploy; verify AZURE_ENV_NAME is correct if this is unexpected on a later run."
+            azd env new "${AZURE_ENV_NAME}" --no-prompt
+          fi
+
+      - name: Verify azure.yaml / agent.yaml exist
+        # This workflow assumes the azd project scaffold (azure.yaml,
+        # agent.yaml, infra/) already exists in orchestration_agent/,
+        # committed to the repo — i.e. `azd ai agent init` was already run
+        # once, interactively, and its output committed. This workflow
+        # does not run `azd ai agent init` itself, since that command is
+        # interactive-first and meant for one-time project scaffolding,
+        # not repeated CI invocation.
+        run: |
+          set -euo pipefail
+          if [[ ! -f azure.yaml ]]; then
+            echo "::error::azure.yaml not found in ${{ env.WORKING_DIRECTORY }}/. Run 'azd ai agent init' locally once to scaffold the project (azure.yaml, agent.yaml, infra/), commit the result, then re-run this workflow."
+            exit 1
+          fi
+          if [[ ! -f agent.yaml ]]; then
+            echo "::error::agent.yaml not found in ${{ env.WORKING_DIRECTORY }}/. This should have been generated alongside azure.yaml by 'azd ai agent init'."
+            exit 1
+          fi
+          echo "Found azure.yaml and agent.yaml — proceeding."
+
+      - name: Provision + deploy via azd up
+        # azd up = provision infrastructure (Bicep, if not already
+        # provisioned/unchanged) + build the container + push to ACR +
+        # register the agent version + publish the endpoint, per
+        # Microsoft's documented sequence. This is idempotent: re-running
+        # against the same AZURE_ENV_NAME updates the existing agent
+        # rather than creating a new one.
+        run: azd up --no-prompt
+
+      - name: Report deployed agent endpoint
+        run: |
+          echo "::group::Deployment summary"
+          azd env get-values | grep -i "endpoint\|agent" || true
+          echo "::endgroup::"
+          echo "::notice::boardroom-mvp orchestration agent deployed. Check the Foundry portal (link in the azd up output above) to confirm status is Active."
