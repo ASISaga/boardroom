@@ -1,1 +1,5 @@
-requirements.txt
+agent-framework>=1.11.0
+agent-framework-ag-ui
+fastapi
+uvicorn[standard]
+azure-identity
