@@ -149,13 +149,13 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run orchestration logic tests (no PowerFx/.NET dependency)
-        run: python3 tests/test_boardroom_orchestration.py
+        run: python3 python3 -m tests.test_boardroom_orchestration
 
       - name: Run AG-UI endpoint integration test
         env:
           FOUNDRY_PROJECT_ENDPOINT: https://fake.example.com
           DEFAULT_MODEL_DEPLOYMENT: fake-model
-        run: python3 tests/test_main_agui_endpoint.py
+        run: python3 python3 -m tests.test_main_agui_endpoint
 
   deploy:
     name: Deploy (${{ inputs.environment || 'staging' }})
