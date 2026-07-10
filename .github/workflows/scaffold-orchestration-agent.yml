@@ -1,0 +1,316 @@
+# Scaffold + provision the boardroom-mvp orchestration agent's azd project.
+#
+# ⚠️  MANUALLY TRIGGERED ONLY (workflow_dispatch) — never runs on push.
+# --------------------------------------------------------------------------
+# This workflow exists to do the ONE-TIME (or occasional, deliberate)
+# scaffolding step that deploy-orchestration-agent.yml assumes already
+# happened: generating azure.yaml, agent.yaml, and infra/*.bicep via
+# `azd ai agent init`, then provisioning + deploying via `azd up`.
+#
+# WHY THIS IS SEPARATE FROM THE MAIN DEPLOY WORKFLOW, AND WHY IT OPENS A PR
+# INSTEAD OF COMMITTING DIRECTLY TO main
+# --------------------------------------------------------------------------
+# `azd ai agent init` is documented as interactive-first. A currently OPEN
+# Microsoft/azure-dev issue (#6819, "azd ai agent init: Document --no-prompt
+# behavior and ensure CLI flag coverage") confirms:
+#   - `init` silently switches to --no-prompt mode whenever no TTY is
+#     detected (which is ALWAYS true on a GitHub Actions runner) — this
+#     behavior is not documented in the CLI's own help text.
+#   - There is CURRENTLY NO CLI FLAG for model deployment selection
+#     (tracked separately as issue #6816, open as of this writing) — a
+#     real, confirmed gap, not a hypothetical one.
+#   - Environment name defaulting and subscription auto-selection in
+#     non-interactive mode are also tracked as separate open gaps
+#     (#6817, #6818).
+# In short: unattended `init --no-prompt` can produce an INCOMPLETE or
+# WRONG scaffold today, with no guarantee the CLI will error loudly if it
+# does. Given that, this workflow treats its own output as a DRAFT for
+# human review — it opens a pull request rather than committing to main
+# directly, and the PR description explicitly calls out what to check
+# before merging.
+#
+# WHAT THIS WORKFLOW ASSUMES YOU'VE ALREADY DECIDED
+# --------------------------------------------------------------------------
+#   - Which Azure subscription and region (location) to provision into —
+#     supplied as workflow_dispatch inputs below, since `azd env set
+#     AZURE_SUBSCRIPTION_ID`/`AZURE_LOCATION` require real values and
+#     init's own non-interactive mode does not reliably infer them
+#     (per the open issues above).
+#   - Which Foundry project to target, if an existing one should be reused
+#     rather than a new one created — supplied via the optional
+#     foundry_project_id input, passed to init's --project-id flag.
+#
+# WHAT HAPPENS IF YOU RE-RUN THIS AGAINST AN EXISTING SCAFFOLD
+# --------------------------------------------------------------------------
+# The "Check for existing scaffold" step below refuses to proceed if
+# azure.yaml already exists in orchestration_agent/, to avoid silently
+# overwriting a working, hand-reviewed project. To intentionally
+# regenerate, delete the existing files first in a separate commit, or
+# pass force_reinit: true.
+
+name: Scaffold Orchestration Agent (azd ai agent init)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target GitHub environment (controls which secrets are used)'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+        default: staging
+      azure_subscription_id:
+        description: 'Azure subscription ID to provision into (required — azd env set AZURE_SUBSCRIPTION_ID)'
+        required: true
+        type: string
+      azure_location:
+        description: 'Azure region to provision into, e.g. eastus, northcentralus (required — azd env set AZURE_LOCATION)'
+        required: true
+        type: string
+      azd_env_name:
+        description: 'azd environment name to create/use (should match AZURE_ENV_NAME configured on the target GitHub environment)'
+        required: true
+        type: string
+      foundry_project_id:
+        description: 'Optional: existing Foundry project resource ID to target (azd ai agent init --project-id). Leave blank to let init create a new Foundry project.'
+        required: false
+        type: string
+        default: ''
+      agent_manifest_path_or_url:
+        description: 'Optional: path or URL to an agent.manifest.yaml to scaffold from (azd ai agent init -m). Leave blank to scaffold from existing code in orchestration_agent/.'
+        required: false
+        type: string
+        default: ''
+      force_reinit:
+        description: 'Allow overwriting an existing azure.yaml/agent.yaml/infra/ (DANGEROUS — only use if you have already deleted/backed up the existing scaffold intentionally)'
+        required: false
+        type: boolean
+        default: false
+      run_azd_up:
+        description: 'Run azd up (provision + deploy) after init, before opening the PR. If false, only scaffolds files for review — nothing is provisioned in Azure.'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+
+env:
+  WORKING_DIRECTORY: orchestration_agent
+  AZD_VERSION: '1.27.0'
+
+jobs:
+  scaffold:
+    name: Scaffold (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Check for existing scaffold
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.force_reinit }}" == "true" ]]; then
+            echo "::warning::force_reinit=true — proceeding even if azure.yaml/agent.yaml/infra/ already exist."
+            exit 0
+          fi
+          FOUND=""
+          [[ -f azure.yaml ]] && FOUND="${FOUND} azure.yaml"
+          [[ -f agent.yaml ]] && FOUND="${FOUND} agent.yaml"
+          [[ -d infra ]] && FOUND="${FOUND} infra/"
+          if [[ -n "${FOUND}" ]]; then
+            echo "::error::Existing scaffold files found:${FOUND} — refusing to overwrite. Delete them in a separate commit first if you intend to regenerate, or re-run with force_reinit: true if you understand the risk."
+            exit 1
+          fi
+          echo "No existing scaffold found — safe to proceed."
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install azd
+        uses: Azure/setup-azd@v2
+        with:
+          version: ${{ env.AZD_VERSION }}
+
+      - name: Install azd ai agent extension
+        run: azd ext install azure.ai.agents
+
+      - name: Configure azd to reuse the Azure CLI's OIDC session
+        run: azd config set auth.useAzCliAuth "true"
+
+      - name: Create/select the azd environment before init
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        env:
+          AZD_ENV_NAME: ${{ inputs.azd_env_name }}
+        run: |
+          set -euo pipefail
+          # NOTE: an earlier draft of this workflow passed an unconfirmed
+          # `--environment` flag directly to `azd ai agent init`. That
+          # flag was not directly confirmed against real documentation, so
+          # rather than risk an invalid argument, this step uses the
+          # CONFIRMED mechanism instead (the same one used in
+          # deploy-orchestration-agent.yml): create/select the azd
+          # environment explicitly, before running init, so init operates
+          # within that already-selected environment context.
+          if azd env list 2>/dev/null | grep -q "^${AZD_ENV_NAME}\b"; then
+            azd env select "${AZD_ENV_NAME}"
+          else
+            azd env new "${AZD_ENV_NAME}" --no-prompt
+          fi
+
+      - name: Run azd ai agent init (--no-prompt)
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        env:
+          FOUNDRY_PROJECT_ID: ${{ inputs.foundry_project_id }}
+          MANIFEST: ${{ inputs.agent_manifest_path_or_url }}
+        run: |
+          set -euo pipefail
+          echo "::group::azd ai agent init"
+
+          # --no-prompt is passed explicitly even though init auto-detects
+          # the non-TTY CI environment and would apply it anyway (per the
+          # open documentation gap noted in this workflow's header
+          # comment) — being explicit here means this command's behavior
+          # doesn't silently change if/when that auto-detection is patched
+          # or altered in a future azd release.
+          INIT_ARGS=(--no-prompt)
+
+          if [[ -n "${FOUNDRY_PROJECT_ID}" ]]; then
+            INIT_ARGS+=(--project-id "${FOUNDRY_PROJECT_ID}")
+          fi
+          if [[ -n "${MANIFEST}" ]]; then
+            INIT_ARGS+=(-m "${MANIFEST}")
+          fi
+
+          echo "Running: azd ai agent init ${INIT_ARGS[*]}"
+          azd ai agent init "${INIT_ARGS[@]}"
+
+          echo "::endgroup::"
+
+      - name: azd env set AZURE_SUBSCRIPTION_ID
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        run: |
+          set -euo pipefail
+          # Required per Microsoft's own hosted-agent quickstart: even
+          # after `init --no-prompt`, AZURE_SUBSCRIPTION_ID and
+          # AZURE_LOCATION are NOT reliably inferred and must be set
+          # explicitly before `azd up` — confirmed directly in the
+          # quickstart's own documented sequence:
+          #   "Before continuing, set AZURE_SUBSCRIPTION_ID and
+          #   AZURE_LOCATION: azd env set AZURE_SUBSCRIPTION_ID <id>
+          #   azd env set AZURE_LOCATION <region>"
+          azd env set AZURE_SUBSCRIPTION_ID "${{ inputs.azure_subscription_id }}"
+
+      - name: azd env set AZURE_LOCATION
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        run: |
+          set -euo pipefail
+          azd env set AZURE_LOCATION "${{ inputs.azure_location }}"
+
+      - name: Show generated azd environment values (sanity check)
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        run: |
+          echo "::group::azd env get-values"
+          azd env get-values || true
+          echo "::endgroup::"
+
+      - name: List generated files
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        run: |
+          echo "::group::Generated scaffold files"
+          echo "--- azure.yaml ---"
+          cat azure.yaml 2>/dev/null || echo "(not found)"
+          echo ""
+          echo "--- agent.yaml ---"
+          cat agent.yaml 2>/dev/null || echo "(not found)"
+          echo ""
+          echo "--- infra/ contents ---"
+          find infra -type f 2>/dev/null || echo "(infra/ not found)"
+          echo "::endgroup::"
+
+      - name: Run azd up (provision + deploy)
+        if: inputs.run_azd_up == true
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        run: |
+          set -euo pipefail
+          echo "::warning::run_azd_up=true — this will provision REAL Azure resources and deploy the agent, using the freshly-generated (not yet human-reviewed) scaffold. Prefer running with run_azd_up=false first, reviewing the opened PR, merging it, THEN provisioning via the normal deploy-orchestration-agent.yml workflow."
+          azd up --no-prompt
+
+      - name: Create pull request with the generated scaffold
+        # NOTE: this requires "Allow GitHub Actions to create pull
+        # requests" to be enabled under repo Settings > Actions > General
+        # > Workflow permissions (or the org-level equivalent). Without
+        # it, this step fails even with contents: write / pull-requests:
+        # write permissions granted above — confirmed as a documented,
+        # separate prerequisite of this action.
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "scaffold: generate azd project for orchestration_agent via azd ai agent init"
+          branch: "scaffold/orchestration-agent-azd-init"
+          delete-branch: true
+          title: "[Review required] azd scaffold for orchestration_agent"
+          labels: |
+            needs-review
+            infrastructure
+          body: |
+            ## ⚠️ This PR was generated by an unattended `azd ai agent init --no-prompt` run — review before merging
+
+            This scaffold was generated non-interactively, in CI. Per a currently
+            **open** Microsoft/azure-dev issue
+            ([#6819](https://github.com/Azure/azure-dev/issues/6819)),
+            non-interactive `azd ai agent init` has known, confirmed gaps:
+
+            - **No CLI flag exists yet for model deployment selection**
+              ([#6816](https://github.com/Azure/azure-dev/issues/6816), open).
+              **Check `azure.yaml`'s `deployments:` section carefully** — it
+              may be missing, wrong, or defaulted to something you don't want.
+            - Environment name defaulting and subscription auto-selection in
+              non-interactive mode are also open gaps
+              ([#6817](https://github.com/Azure/azure-dev/issues/6817),
+              [#6818](https://github.com/Azure/azure-dev/issues/6818)).
+
+            ### Checklist before merging
+
+            - [ ] `azure.yaml` — confirm the `deployments:` section has the
+                  correct model name/version/SKU/capacity for each agent
+                  (`founder-mvp`, `cfo-mvp`, `cmo-mvp` model deployments,
+                  and this orchestration agent's own).
+            - [ ] `agent.yaml` — confirm `name`, `protocols`, and
+                  `environment_variables` match what `orchestration_agent/main.py`
+                  actually expects (`FOUNDRY_PROJECT_ENDPOINT`,
+                  `DEFAULT_MODEL_DEPLOYMENT`, etc. — see that file's own
+                  `os.environ` reads).
+            - [ ] `infra/*.bicep` — confirm the resource group / Foundry
+                  project this targets is the one you actually intend
+                  (especially if `foundry_project_id` was left blank and a
+                  **new** Foundry project may have been created).
+            - [ ] Confirm `AZURE_ENV_NAME` = `${{ inputs.azd_env_name }}` is
+                  set as a secret/variable on the `${{ inputs.environment }}`
+                  GitHub environment, matching what was used here.
+
+            ### Run parameters
+
+            | Input | Value |
+            |---|---|
+            | Environment | `${{ inputs.environment }}` |
+            | Subscription ID | `${{ inputs.azure_subscription_id }}` |
+            | Location | `${{ inputs.azure_location }}` |
+            | azd environment name | `${{ inputs.azd_env_name }}` |
+            | Foundry project ID | `${{ inputs.foundry_project_id || '(none — new project likely created)' }}` |
+            | Manifest | `${{ inputs.agent_manifest_path_or_url || '(none — scaffolded from existing code)' }}` |
+            | `azd up` run in this workflow | `${{ inputs.run_azd_up }}` |
+
+            ${{ inputs.run_azd_up == true && '⚠️ **azd up was run as part of this workflow** — real Azure resources may already be provisioned, even though this PR is not yet merged. Review carefully; do not simply close this PR without checking whether cleanup is needed.' || 'azd up was NOT run — no Azure resources were provisioned by this workflow. After merging this PR, trigger `deploy-orchestration-agent.yml` normally to provision and deploy.' }}
