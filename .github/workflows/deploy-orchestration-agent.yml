@@ -124,7 +124,7 @@ env:
   # silently breaking if azd ships a change during the documented
   # "expect command and flag churn until GA" period for this preview
   # feature.
-  AZD_VERSION: '1.21.3'
+  AZD_VERSION: '1.27.0'
 
 jobs:
   test:
